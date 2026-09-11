@@ -1177,3 +1177,114 @@ Command: `uv run python scripts/overfit_single_branch.py --branch slow
 --no-self-recurrence --direct-residual --steps 1000`.
 
 ---
+
+## Run 18 — `slow` + direct residual + adaptive tau: also clean
+
+`uv run python scripts/overfit_single_branch.py --branch slow
+--no-self-recurrence --direct-residual --steps 1000` (the branch that
+previously produced the worst explosions of the entire investigation — peak
+grad_norm 10,534 in Run 13):
+
+```text
+step    0  total 5.3893  grad_norm  6.963
+step  250  total 1.2672  grad_norm  8.650
+step  500  total 0.6332  grad_norm  7.736
+step  750  total 0.4258  grad_norm  5.977
+step  999  total 0.3807  grad_norm 11.252
+best loss: 0.3412 (93.7% reduction)
+```
+
+Grad norm stayed calm (4-12 range) the entire run, essentially matching
+`mid`'s Run 17 result (0.3466). **User's verdict: speech reconstructed on
+listening, same as mid.**
+
+### Analysis — recovery plan step 2 confirmed; root cause fully resolved
+
+Both `mid` and `slow` — the two branches responsible for every explosion
+seen since Run 11 — train cleanly with adaptive tau restored, once the
+direct residual path removes the sole-transport-channel burden. This closes
+the investigation that began at Run 11: the problem was never adaptive tau,
+never the candidate's self-recurrence, never continuous-time dynamics as a
+concept — it was specifically forcing a slow-decaying state to also carry
+full-bandwidth instantaneous signal.
+
+### Next step — assemble the full multi-timescale encoder
+
+Per the user's plan: `fast + mid + slow` together, still no cross-timescale
+connections yet (prove three independent branches + direct path work
+together before adding communication between them), with a **gated fusion**
+instead of plain concatenation:
+
+```text
+z_t = W_x*f_t + g_F*P_F(h_t^F) + g_M*P_M(h_t^M) + g_S*P_S(h_t^S)
+```
+
+`g_F/g_M/g_S` initialized small (~0.05-0.1), so training starts close to
+the already-proven `frontend -> generator` baseline (Run 12) and the
+temporal branches have to *earn* their contribution rather than being
+relied on from step 0 — expected to be more stable than starting with
+`g=1` and hoping three simultaneously-training recurrent branches don't
+fight the direct path early on.
+
+Configuration for this test: `candidate_uses_hidden=False`, `adaptive_tau=
+True`, `direct_residual=True`, no cross-timescale connections. If this
+overfits cleanly, the user considers the **Stage 1 encoder architecture
+found**. Next after that: reintroduce `ContinuousDecoder` and repeat the
+full `audio -> encoder -> decoder -> generator` sanity test (this is what
+originally produced noise, starting at Run 4/5/8) to confirm the fix holds
+end-to-end.
+
+**Decoder design insight (for later, not yet implemented):** the same
+principle likely applies to the decoder. Rather than forcing `d_t^F/d_t^M/
+d_t^S` to be the sole channel for event information, give the decoder a
+direct event-injection path too:
+
+```text
+y_t = W_event*e_t + P_F(d_t^F) + P_M(d_t^M) + P_S(d_t^S)   (when an event arrives)
+y_t =              P_F(d_t^F) + P_M(d_t^M) + P_S(d_t^S)   (between events)
+```
+
+This maps cleanly onto AEVUM's actual event-driven design goal: direct
+injection when there's new information to transmit, continuous dynamics
+carrying the signal between events. Not yet tested — queued after the
+encoder-side fix is confirmed end-to-end.
+
+Command: `uv run python scripts/overfit_single_branch.py` does not support
+multi-branch fusion yet — this next test needs a new script (not yet
+written).
+
+---
+
+## Run 19 (setup) — `scripts/overfit_multiscale_encoder.py` written
+
+Implements the full `fast+mid+slow` encoder described above: three
+`ContinuousTimeCell`s (each `candidate_uses_hidden=False`, full adaptive
+tau, no cross-timescale connections), each with its own projection, fused
+via `z_t = W_x*f_t + g_fast*P_fast(h_fast) + g_mid*P_mid(h_mid) +
+g_slow*P_slow(h_slow)`. `W_x` initialized to the identity (`Conv1d` with an
+identity weight), gates initialized to `--gate-init` (default 0.1).
+
+Verified with a 2-step smoke run (not real training, just a shape/crash
+check): runs cleanly, `total` loss and `grad_norm` are sane (5.76, then
+6.18), gate values move slightly as expected (`g_fast/g_mid/g_slow`
+0.1 -> ~0.10, ~0.10, ~0.098). No shape or runtime errors.
+
+Command for the real run: `uv run python scripts/overfit_multiscale_encoder.py
+--steps 2000` (writes to `outputs/multiscale_encoder/`). This will be
+slower per step than the single-branch tests — three sequential
+`ContinuousTimeCell` calls per timestep instead of one — expect roughly
+3x Run 13-18's per-step time.
+
+---
+
+## Cross-project note
+
+The general lesson from Runs 11-18 (a slow-decaying continuous-time state
+cannot safely be the sole transport channel for high-bandwidth signal; give
+the consumer a direct/residual path instead) is written up independently of
+AEVUM-specific details at `../lessons-continuous-time-dynamics.md` (one
+level up from this repo, at the Manifestro root), since it applies to any
+continuous-time/leaky-integrator recurrent component and may be relevant to
+other Manifestro projects.
+
+---
