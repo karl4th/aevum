@@ -1056,3 +1056,82 @@ Command: `uv run python scripts/overfit_single_branch.py --branch mid
 --no-self-recurrence --fixed-tau 0.275 --direct-residual --steps 1000`.
 
 ---
+
+## Run 16 — `mid` + direct residual: Result A, decisively
+
+`uv run python scripts/overfit_single_branch.py --branch mid
+--no-self-recurrence --fixed-tau 0.275 --direct-residual --steps 1000`
+(`z_t = f_t + P(h_t^mid)`, same problematic `mid` branch, same fixed
+`tau=0.275`, same no-self-recurrence candidate — only the direct path is
+new):
+
+```text
+step    0  total 5.5729  wav 0.0506  mel 2.7722  stft 2.7501  grad_norm 17.496
+step  100  total 4.2784  wav 0.0439  mel 2.1418  stft 2.0927  grad_norm  2.451
+step  250  total 1.5416  wav 0.0509  mel 0.5348  stft 0.9558  grad_norm  6.034
+step  500  total 0.6948  wav 0.0401  mel 0.1600  stft 0.4948  grad_norm 10.323
+step  750  total 0.4516  wav 0.0281  mel 0.0964  stft 0.3272  grad_norm  6.576
+step  999  total 0.4816  wav 0.0212  mel 0.1352  stft 0.3252  grad_norm  6.210
+best loss: 0.3473 (93.8% reduction)
+```
+
+Grad norm stayed in the calm 2-13 range the entire run — no explosions at
+all, unlike every previous `mid`/`slow` configuration. `wav` L1 dropped
+substantially and monotonically (0.0506 -> 0.0207 best) for the first time
+on a recurrent branch (previously only the free-latent and
+frontend-only-linear tests showed this). **User's listening verdict: "один
+в один"** (identical to target).
+
+### Analysis
+
+**Confirms the diagnosis decisively.** `mid`'s recurrence itself was never
+the problem — being forced to serve as the *sole* transport channel for
+full-bandwidth acoustic detail was. Once the generator has an unfiltered
+path to `f_t`, `mid`'s narrow-bandwidth state stops being a bottleneck the
+optimizer has to fight, and training becomes as clean as the free-latent
+and frontend-only experiments. This validates the residual-highway idea
+(originally proposed for the decoder side in Run 10, now confirmed on the
+encoder side) as the fix, not a workaround.
+
+### Next steps — restore capabilities one at a time, most valuable first
+
+Plan (user), each step gated on the previous one succeeding:
+
+1. **`mid` + direct residual + restore adaptive tau** (still no candidate
+   self-recurrence): does reinstating `tau_t = f(x_t, h_{t-1})` stay stable
+   now that `mid` isn't the sole transport path? This is the capability
+   that actually matters for AEVUM (dynamic temporal resolution) — worth
+   testing before anything else.
+2. If (1) holds: same for `slow` + direct residual + adaptive tau. `slow`
+   no longer needs to transport speech itself — residual does that; this
+   tests whether `slow` can now do its *actual* job (long memory) safely.
+2. Assemble `fast+mid+slow` together — still no candidate self-recurrence,
+   direct residual, **no cross-timescale connections yet** — with a gated
+   fusion instead of plain concatenation:
+   `z_t = W_x*f_t + g_F*P_F(h_F) + g_M*P_M(h_M) + g_S*P_S(h_S)`, gates
+   `g_F/g_M/g_S` initialized small (~0.05-0.1) so the model starts close to
+   the already-proven `frontend -> generator` baseline and has to *earn*
+   using the temporal branches rather than depending on them from step 0.
+3. Only after that is stable: restore cross-timescale connections
+   (tech_spec.md section 9).
+
+**Explicitly not restoring:** the candidate's own `W_hh*h_{t-1}` term (Run
+14 showed no evidence it's needed — memory already exists via
+`alpha_t*h_{t-1}`, and there's no reason to add a second recurrent
+mechanism just because the original spec had one).
+
+**Reframing the encoder** (no longer "audio -> continuous state -> speech
+representation", but "instantaneous representation + fast/mid/slow temporal
+memory -> fused z(t)") does not weaken AEVUM: the direct path exists only
+*before* the compression bottleneck (predictor / innovation / event gate /
+quantization) — the decoder still only ever receives transmitted events,
+never a continuously-streamed `f_t`. Temporal dynamics go back to doing
+what they're suited for (memory/context/prediction), not pretending to be a
+wideband transport channel.
+
+Command: `uv run python scripts/overfit_single_branch.py --branch mid
+--no-self-recurrence --direct-residual --steps 1000` (no `--fixed-tau`, no
+`--tau-input-only` — both default to the original full adaptive-tau
+formula).
+
+---
