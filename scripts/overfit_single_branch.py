@@ -72,6 +72,11 @@ def main() -> None:
         action="store_true",
         help="keep tau adaptive/learned but drop h_{t-1} from its input (tau_t = f(x_t) instead of f(x_t, h_{t-1})); run only after --fixed-tau, not at the same time (per Run 14 plan)",
     )
+    parser.add_argument(
+        "--direct-residual",
+        action="store_true",
+        help="add a direct instantaneous path: z_t = f_t + P(h_t) instead of z_t = P(h_t) alone -- tests whether bypassing the branch's low bandwidth (1-alpha per step) with an unfiltered frontend path stabilizes training (Run 15)",
+    )
     parser.add_argument("--data-root", type=str, default="data/raw")
     parser.add_argument("--librispeech-url", type=str, default="dev-clean")
     parser.add_argument("--index", type=int, default=0)
@@ -115,7 +120,8 @@ def main() -> None:
     print(
         f"branch={args.branch} tau_range=({tau_min},{tau_max}) hidden_dim={BRANCH_HIDDEN_DIM} "
         f"candidate_uses_hidden={not args.no_self_recurrence} adaptive_tau={args.fixed_tau is None} "
-        f"fixed_tau={args.fixed_tau} tau_uses_hidden={not args.tau_input_only} params={param_count:,}"
+        f"fixed_tau={args.fixed_tau} tau_uses_hidden={not args.tau_input_only} "
+        f"direct_residual={args.direct_residual} params={param_count:,}"
     )
 
     criterion = ReconstructionLoss().to(device)
@@ -128,6 +134,8 @@ def main() -> None:
         suffix += f"_fixed_tau{args.fixed_tau}"
     if args.tau_input_only:
         suffix += "_tau_input_only"
+    if args.direct_residual:
+        suffix += "_direct_residual"
     out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/single_branch_{args.branch}{suffix}")
     out_dir.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(out_dir / "target.wav"), target[0].detach().cpu(), SAMPLE_RATE)
@@ -143,7 +151,7 @@ def main() -> None:
             hidden_steps.append(state)
         hidden = torch.stack(hidden_steps, dim=-1)  # [B, hidden_dim, T]
 
-        z = projection(hidden)
+        z = projection(hidden) + features if args.direct_residual else projection(hidden)
         recon = generator(z)
         loss_dict = criterion(target, recon)
         loss = loss_dict["total"]

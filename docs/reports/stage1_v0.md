@@ -971,3 +971,88 @@ Command: `uv run python scripts/overfit_single_branch.py --branch mid
 --no-self-recurrence --fixed-tau 0.275 --steps 1000`.
 
 ---
+
+## Run 15 — `mid` with fully fixed tau: still explodes, both recurrence hypotheses closed
+
+`uv run python scripts/overfit_single_branch.py --branch mid
+--no-self-recurrence --fixed-tau 0.275 --steps 1000` (no candidate
+self-recurrence, no learned tau network at all — `alpha` is the literal
+constant `exp(-0.01/0.275) = 0.9643`):
+
+```text
+step  100  total  5.3597  grad_norm    4.378
+step  125  total  7.9166  grad_norm   99.038
+step  150  total  5.5898  grad_norm  176.145
+step  175  total 23.4401  grad_norm 1819.649
+step  200  total 23.6349  grad_norm 1878.826
+step  350  total  8.3021  grad_norm 1243.094
+step  400  total  5.3647  grad_norm  162.437
+step  425  total 24.7285  grad_norm 1813.604
+step  550  total 25.7691  grad_norm  656.894
+step  625  total  7.8035  grad_norm 2006.976
+```
+
+### Analysis — both recurrence-instability hypotheses definitively closed
+
+With `alpha` a true constant (not a function of `h_{t-1}` at all), the
+state-to-state Jacobian is exactly `d(h_t)/d(h_{t-1}) = alpha*I` — a
+contraction (`0 < alpha < 1`), not an expanding map:
+`d(h_t)/d(h_{t-k}) = alpha^k * I -> 0`. There is no exploding-recurrence
+mechanism left to blame. And yet the system explodes just as badly as
+Run 13/14. **This rules out both the candidate's `W_hh h_{t-1}` term (Run
+14) and the state-dependent adaptive-tau feedback (this run) as the cause.**
+Something else is producing these gradients.
+
+**New hypothesis: not an unstable dynamical system, but an ill-conditioned
+optimization problem.** `mid`'s channel only admits `1-alpha ~= 3.6%` new
+information per 10 ms step — a severe bandwidth limit if it's the *only*
+path from frontend features to the generator. To reconstruct fast acoustic
+detail (plosives, fricatives, formant transitions, phase) through a channel
+that attenuates each step's contribution by ~28x, upstream weights
+(candidate, projection, generator) are pushed to compensate with
+correspondingly large gain. Once `candidate`'s `tanh` saturates or a
+downstream projection is unbounded, that compensation shows up as huge,
+unstable gradients — not because the recurrence itself is mathematically
+exploding, but because the optimizer is fighting a badly-conditioned
+problem. This is consistent with the full pattern across every run:
+`fast` (`1-alpha~20%`) trains cleanly, `mid` (`~3.6%`) and `slow` (`~0.4%`)
+both fail, worse as bandwidth shrinks — exactly tracking `1-alpha`, not any
+recurrence-stability quantity.
+
+### Next step — test with a direct instantaneous residual path, not less recurrence
+
+No further recurrence-removal tests planned — the recurrence itself has
+been cleared. Instead, test the resulting architectural hypothesis
+directly: give the generator an unfiltered path to the frontend feature
+alongside the (still bandwidth-limited) `mid` state, so `mid` is no longer
+the *only* transport channel:
+
+```text
+z_t = f_t + P(h_t^mid)
+```
+
+Implemented as `--direct-residual` on `scripts/overfit_single_branch.py`
+(adds the raw frontend feature to the projected hidden state before the
+generator). Keeps everything else from Run 15 unchanged — same `mid`
+branch, same `--no-self-recurrence --fixed-tau 0.275`, deliberately *not*
+switching to `fast` or restoring adaptivity, so this isolates the residual
+path's effect specifically on the branch that has been failing hardest
+under controlled conditions.
+
+If this stabilizes (`grad_norm` 5-30, smooth decrease, speech emerges), the
+architectural conclusion is: **temporal (mid/slow) states cannot serve as
+the primary information transport channel — they should be a context/
+memory layer on top of an instantaneous representation, not instead of it**
+(matching the residual-highway idea already proposed for the decoder side
+in Run 10's analysis, now on the encoder side too). Crucially, this loses
+nothing for the eventual event-driven codec: the direct path only needs to
+exist *before* the compression bottleneck (predictor/innovation/event
+gate/quantization) — the decoder still only ever receives transmitted
+events, never a continuously-streamed `f_t`. Reframing:
+`representation = instantaneous innovation + temporal context`, and
+`transmitted information = representation - predicted representation`.
+
+Command: `uv run python scripts/overfit_single_branch.py --branch mid
+--no-self-recurrence --fixed-tau 0.275 --direct-residual --steps 1000`.
+
+---
