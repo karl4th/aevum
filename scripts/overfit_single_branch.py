@@ -56,6 +56,11 @@ def load_real_clip(data_root: str, url: str, index: int, seconds: float, device:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Overfit a single continuous-time branch + generator on one real clip")
     parser.add_argument("--branch", choices=["fast", "mid", "slow"], required=True)
+    parser.add_argument(
+        "--no-self-recurrence",
+        action="store_true",
+        help="drop h_{t-1} from the candidate's own input (u_t = phi(W_x x_t) instead of phi(W_x x_t + W_hh h_{t-1})); tests the double-recurrence/positive-feedback hypothesis from Run 13",
+    )
     parser.add_argument("--data-root", type=str, default="data/raw")
     parser.add_argument("--librispeech-url", type=str, default="dev-clean")
     parser.add_argument("--index", type=int, default=0)
@@ -75,7 +80,9 @@ def main() -> None:
 
     frontend = CausalAcousticFrontend().to(device)
     tau_min, tau_max = BRANCH_TAU_RANGES[args.branch]
-    cell = ContinuousTimeCell(frontend.output_dim, BRANCH_HIDDEN_DIM, tau_min, tau_max).to(device)
+    cell = ContinuousTimeCell(
+        frontend.output_dim, BRANCH_HIDDEN_DIM, tau_min, tau_max, candidate_uses_hidden=not args.no_self_recurrence
+    ).to(device)
     projection = nn.Conv1d(BRANCH_HIDDEN_DIM, frontend.output_dim, kernel_size=1).to(device)
     generator = CausalWaveformGenerator(input_dim=frontend.output_dim).to(device)
 
@@ -84,12 +91,16 @@ def main() -> None:
 
     modules = [frontend, cell, projection, generator]
     param_count = sum(p.numel() for m in modules for p in m.parameters())
-    print(f"branch={args.branch} tau_range=({tau_min},{tau_max}) hidden_dim={BRANCH_HIDDEN_DIM} params={param_count:,}")
+    print(
+        f"branch={args.branch} tau_range=({tau_min},{tau_max}) hidden_dim={BRANCH_HIDDEN_DIM} "
+        f"candidate_uses_hidden={not args.no_self_recurrence} params={param_count:,}"
+    )
 
     criterion = ReconstructionLoss().to(device)
     optimizer = torch.optim.AdamW([p for m in modules for p in m.parameters()], lr=args.lr)
 
-    out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/single_branch_{args.branch}")
+    suffix = "_no_self_rec" if args.no_self_recurrence else ""
+    out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/single_branch_{args.branch}{suffix}")
     out_dir.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(out_dir / "target.wav"), target[0].detach().cpu(), SAMPLE_RATE)
 

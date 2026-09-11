@@ -14,13 +14,27 @@ from torch import nn
 class ContinuousTimeCell(nn.Module):
     """One adaptive leaky-integrator step: ``h_t = alpha_t * h_{t-1} + (1 - alpha_t) * u_t``."""
 
-    def __init__(self, input_dim: int, hidden_dim: int, tau_min: float = 0.005, tau_max: float = 5.0) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        tau_min: float = 0.005,
+        tau_max: float = 5.0,
+        candidate_uses_hidden: bool = True,
+    ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.tau_min = tau_min
         self.tau_max = tau_max
+        self.candidate_uses_hidden = candidate_uses_hidden
 
-        self.candidate = nn.Linear(input_dim + hidden_dim, hidden_dim)
+        # candidate_uses_hidden=False drops h_{t-1} from the candidate's own input,
+        # so old state re-enters the update only through the alpha-weighted memory
+        # term, not a second time through a learned nonlinear recurrent transform
+        # (docs/reports/stage1_v0.md, Run 13: that double path is the suspected
+        # source of the mid/slow branch gradient explosions).
+        candidate_input_dim = input_dim + hidden_dim if candidate_uses_hidden else input_dim
+        self.candidate = nn.Linear(candidate_input_dim, hidden_dim)
         self.time_constant = nn.Linear(input_dim + hidden_dim, hidden_dim)
 
         self._recording = False
@@ -54,7 +68,7 @@ class ContinuousTimeCell(nn.Module):
             ``[B, hidden_dim]`` updated hidden state.
         """
         xh = torch.cat([x_t, h_prev], dim=-1)
-        u_t = torch.tanh(self.candidate(xh))
+        u_t = torch.tanh(self.candidate(xh if self.candidate_uses_hidden else x_t))
         tau_t = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.time_constant(xh))
         alpha_t = torch.exp(-dt / tau_t)
 

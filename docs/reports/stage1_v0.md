@@ -823,3 +823,72 @@ highway, to check whether that combination restores clean reconstruction on
 the complete system.
 
 ---
+
+## Run 13 — Single-branch ablations: fast stable, mid/slow explode
+
+`uv run python scripts/overfit_single_branch.py --branch {fast,mid,slow}
+--steps 1000` (real audio -> frontend -> ONE `ContinuousTimeCell` -> linear
+projection -> generator, no cross-timescale connections).
+
+```text
+fast (tau 0.01-0.08s):  grad_norm stays 0.7-37 the whole run, loss 5.42 -> best 0.3815 (93.0% reduction), no explosions
+mid  (tau 0.05-0.5s):   grad_norm spikes to 552, 1183, 1627, 2392, 2728, 3140, 5088, 3889 at various steps;
+                        loss repeatedly jumps to 20-26 then partially recovers; best loss stalls at 4.5256 after step 275
+slow (tau 0.3-5.0s):    grad_norm spikes to 1895, 2955, 10534(!), 7414, 2635, 1188; even more frequent/severe than mid;
+                        loss repeatedly jumps to 25-26; best loss stalls at 3.1493 after step 300
+```
+
+**Confirms the severity gradient predicted from measured alpha values:**
+fast (alpha~0.80, 20%/step new info) trains cleanly; mid (alpha~0.964,
+3.6%/step) explodes repeatedly and its best loss stalls early; slow
+(alpha~0.996, 0.4%/step) explodes even more severely (peak grad_norm 10,534
+— the largest seen anywhere in this investigation) and its best loss stalls
+even earlier. Notably, `slow` did briefly find a better loss (3.1493) before
+getting knocked off course — capacity isn't dead, but training can't hold a
+stable trajectory.
+
+### Analysis — refined mechanism (not just "more smoothing")
+
+The user's key insight: the failure mode is not merely aggressive low-pass
+filtering (which would predict *slow learning*, not *explosions*) — it's
+specifically that the previous hidden state enters the update **twice**:
+once directly through the memory term (`alpha_t * h_{t-1}`), and again
+through the candidate's own recurrent weights (`u_t =
+phi(W_x x_t + W_hh h_{t-1})`). For a branch with `alpha` close to 1 (slow),
+the old state barely decays *and* gets re-injected through a learned
+nonlinear transform every step — a plausible positive-feedback mechanism
+whose effect compounds across a 200-step backprop-through-time unroll. This
+also explains why `fast` is immune: its strong per-step contraction
+(`1-alpha~0.20`) dominates before any instability in `W_hh` can accumulate
+across time.
+
+### Next step — remove self-recurrence from the candidate only
+
+Minimal, additive change (not a redesign): added `candidate_uses_hidden:
+bool = True` to `ContinuousTimeCell.__init__` (`src/aevum/models/dynamics/
+cell.py`). When `False`, the candidate becomes `u_t = phi(W_x x_t)` — no
+`h_{t-1}` in its own input — while the memory/decay mechanics
+(`tau_t`/`alpha_t`, still computed from both `x_t` and `h_{t-1}`, and
+`h_t = alpha_t*h_{t-1} + (1-alpha_t)*u_t`) are completely unchanged.
+Default is `True` (existing behavior, all current tests still pass
+unchanged). `scripts/overfit_single_branch.py` gained a
+`--no-self-recurrence` flag wiring this through, writing to a separate
+`_no_self_rec`-suffixed output directory.
+
+Plan: run `mid` first (`--branch mid --no-self-recurrence`). If grad_norm
+settles into the 5-30 range with no repeated spikes, loss decreases
+smoothly, and the reconstruction sounds like speech — the diagnosis is
+essentially confirmed. Then repeat for `slow` with the same flag.
+
+If confirmed, this doesn't weaken the architecture — it sharpens it: `h_t =
+alpha_t*h_{t-1} (memory) + (1-alpha_t)*F(x_t) (innovation)`, matching
+AEVUM's own stated philosophy (tech_spec.md section 7) more precisely than
+the original two-recurrent-path design. Cross-timescale communication
+(tech_spec.md section 9) can still be preserved as `u_t^M = phi(W_x x_t +
+C_F*h_t^F + C_S*h_t^S)` — context from *other* branches, without a branch
+self-exciting through its own `W_hh`.
+
+Command: `uv run python scripts/overfit_single_branch.py --branch mid
+--no-self-recurrence --steps 1000`.
+
+---
