@@ -413,3 +413,45 @@ reconstruction actually becomes intelligible speech this time, before
 returning to the full LibriSpeech training run.
 
 ---
+
+## Run 7 — Re-diagnosing after raising eps to 1e-2
+
+Changed `ReconstructionLoss`/`MultiResolutionSTFTLoss` eps from `1e-5`/`1e-7`
+to a shared `1e-2`. Re-ran `uv run python scripts/diagnose_gradients.py
+--source real --steps 200` on the same real clip as Run 6:
+
+```text
+                 generator grad norm      total loss
+before (eps=1e-5/1e-7):  step 0    26.6         17.31
+                         step 25  636.6          9.05
+                         step 50  316.7          7.39
+
+after  (eps=1e-2):       step 0    18.8          5.59
+                         step 25    6.6          5.39
+                         step 50    1.9          5.36
+```
+
+(Lower absolute loss with the larger eps is expected/not comparable across
+settings — log-compression with a larger eps compresses the log-scale more,
+it doesn't mean "better reconstruction" by itself.)
+
+### Analysis
+
+**Hypothesis confirmed, strongly.** The generator's gradient norm didn't
+just shrink, its *trajectory reversed*: before, it exploded upward (26.6 ->
+636.6 -> 316.7); after, it decays monotonically (18.8 -> 6.6 -> 1.9) toward a
+sane single-digit range within 50 steps. All other groups stayed roughly the
+same small scale as Run 6 (tau groups still smallest of all). With clipping
+at norm 1.0, the update direction is now barely perturbed by this artifact
+instead of being dominated by it ~19x versus ~885x at the peak.
+
+### Next step
+
+Re-run the real-clip overfit test (`scripts/sanity_overfit.py --source real
+--steps 500`) with the new eps and listen to the result: does the
+reconstruction become intelligible speech now, or does it still sound like
+noise despite the healthier gradient behavior? This is the test that
+actually matters — a well-behaved gradient norm is necessary but not
+sufficient proof that the underlying noise problem is fixed.
+
+---
