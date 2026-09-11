@@ -537,3 +537,61 @@ leaving only a fixed-depth conv stack.
 Command: `uv run python scripts/overfit_generator_only.py --steps 3000`.
 
 ---
+
+## Run 9 — Generator-only isolation test: Result B
+
+`uv run python scripts/overfit_generator_only.py --steps 3000` (same real
+clip, free latent Z in R^{1x384x200}, no encoder/dynamics/decoder at all).
+
+```text
+step    0  total 5.9731  wav 0.0680  mel 2.7869  stft 3.1183
+step  500  total 0.6126  wav 0.0530  mel 0.1067  stft 0.4529
+step 1000  total 0.3609  wav 0.0419  mel 0.0481  stft 0.2710
+step 2000  total 0.3185  wav 0.0303  mel 0.0677  stft 0.2206
+step 2999  total 0.2159  wav 0.0245  mel 0.0368  stft 0.1546
+best loss: 0.1946
+```
+
+**Result B, decisively.** Best loss 0.1946 (96.7% reduction) is an order of
+magnitude lower than the best any full-pipeline run achieved on this same
+clip/loss (2.0229, 63.8%, Run 8). Critically, `wav` L1 actually decreases
+substantially here (0.068 -> 0.0245, -64%) for the first time in this whole
+investigation — every previous run had it stuck flat around 0.04-0.05
+regardless of how much mel/stft improved. **User's listening verdict: "Один
+в один"** (identical to target).
+
+### Analysis
+
+`generator` is exonerated. Given an unconstrained 100 Hz latent, it
+reproduces this real speech clip essentially perfectly under the exact same
+reconstruction loss that produced noise through the full pipeline. This
+also weakens the "phase-blind magnitude loss" hypothesis from Run 8's
+analysis as a *sufficient* explanation on its own — if the loss were
+fundamentally incapable of specifying a clean waveform, this experiment
+should have produced noise too, same as every other run. It didn't. So the
+loss function can drive a clean reconstruction when the upstream
+representation is good enough; the question now is squarely about what the
+frontend/encoder/decoder chain does to the information before it reaches
+the generator.
+
+### Next step (proposed by the user): add the decoder back in
+
+Second isolation step, `scripts/overfit_decoder_generator.py` (not yet run):
+keep frontend and encoder removed, but reintroduce `ContinuousDecoder`
+(its own norm+projection "head" is already part of its forward pass) between
+the free latent and the generator:
+
+```text
+learnable Z [1, T, 384] -> ContinuousDecoder -> y -> generator -> wav
+```
+
+- **Result A (clean speech again):** decoder + generator both exonerated;
+  the bottleneck narrows to frontend -> encoder dynamics -> encoder head.
+- **Result B (noise again):** since generator just proved capable in
+  isolation, this would point squarely at `ContinuousDecoder` — specifically
+  whether its leaky-integrator update (`d_t = alpha*d_{t-1} +
+  (1-alpha)*u_t`) over-smooths information between steps.
+
+Command: `uv run python scripts/overfit_decoder_generator.py --steps 4000`.
+
+---
