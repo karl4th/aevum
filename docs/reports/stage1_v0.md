@@ -595,3 +595,39 @@ learnable Z [1, T, 384] -> ContinuousDecoder -> y -> generator -> wav
 Command: `uv run python scripts/overfit_decoder_generator.py --steps 4000`.
 
 ---
+
+## Run 10 — Decoder+generator isolation test: Result A (stopped early)
+
+`uv run python scripts/overfit_decoder_generator.py --steps 4000` (same real
+clip, free per-frame latent Z in R^{1x200x384} feeding `ContinuousDecoder`
+directly, then `generator`). Stopped early at step ~400 — result already
+clear, no need to run to completion:
+
+```text
+step    0  total 6.3062  wav 0.0835  mel 2.7974  stft 3.4253
+step  100  total 1.8995  wav 0.0518  mel 0.7097  stft 1.1379
+step  200  total 0.9789  wav 0.0540  mel 0.2394  stft 0.6855
+step  300  total 0.6834  wav 0.0503  mel 0.1317  stft 0.5014
+step  400  total 0.5915  wav 0.0469  mel 0.1132  stft 0.4314
+```
+
+**User's listening verdict at step 400: "практически снова точь в точь"**
+(again essentially identical to target).
+
+### Analysis
+
+**Result A.** Both `ContinuousDecoder` and `generator` are exonerated —
+`ContinuousDecoder`'s leaky-integrator dynamics (`d_t = alpha*d_{t-1} +
+(1-alpha)*u_t`) are not over-smoothing information when fed a good enough
+per-frame input; it can pass through what it's given well enough for clean
+reconstruction. The bottleneck is now narrowed specifically to
+**frontend -> encoder continuous dynamics -> encoder head** (the path that
+turns real audio into `z_t` in the first place) — the only part of the
+full pipeline not yet tested in isolation.
+
+### Next step
+
+User has a specific idea for the next isolating experiment targeting the
+encoder side specifically — to be run next.
+
+---
