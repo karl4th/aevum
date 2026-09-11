@@ -1,0 +1,41 @@
+"""Continuous-time cell with an adaptive time constant (tech_spec.md section 7).
+
+This is the core recurrence used by every timescale branch of the encoder and
+decoder: a leaky-integrator update where the decay ``alpha`` is predicted
+from the current input and previous state, instead of being fixed.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+
+class ContinuousTimeCell(nn.Module):
+    """One adaptive leaky-integrator step: ``h_t = alpha_t * h_{t-1} + (1 - alpha_t) * u_t``."""
+
+    def __init__(self, input_dim: int, hidden_dim: int, tau_min: float = 0.005, tau_max: float = 5.0) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+
+        self.candidate = nn.Linear(input_dim + hidden_dim, hidden_dim)
+        self.time_constant = nn.Linear(input_dim + hidden_dim, hidden_dim)
+
+    def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor, dt: float) -> torch.Tensor:
+        """Advance the state by one observation step of size ``dt`` seconds.
+
+        Args:
+            x_t: ``[B, input_dim]`` input at this step.
+            h_prev: ``[B, hidden_dim]`` previous hidden state.
+            dt: observation interval in seconds (e.g. 0.01 for 10 ms).
+
+        Returns:
+            ``[B, hidden_dim]`` updated hidden state.
+        """
+        xh = torch.cat([x_t, h_prev], dim=-1)
+        u_t = torch.tanh(self.candidate(xh))
+        tau_t = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.time_constant(xh))
+        alpha_t = torch.exp(-dt / tau_t)
+        return alpha_t * h_prev + (1 - alpha_t) * u_t
