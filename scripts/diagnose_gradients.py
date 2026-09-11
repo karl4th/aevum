@@ -90,7 +90,7 @@ def tau_alpha_stats(cell: torch.nn.Module, name: str) -> str:
     tau, alpha = stats["tau"], stats["alpha"]
     if tau.numel() == 0:
         return f"{name:>18}  (no data)"
-    q = torch.tensor([0.0, 0.5, 0.95, 1.0])
+    q = torch.tensor([0.0, 0.5, 0.95, 1.0], device=tau.device)
     tau_q = torch.quantile(tau, q)
     alpha_q = torch.quantile(alpha, q)
     return (

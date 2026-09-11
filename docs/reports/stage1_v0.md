@@ -277,3 +277,139 @@ lower default LR) into it and adding periodic reconstruction-sample dumping
 so the run can actually be listened to, not just judged by loss numbers.
 
 ---
+
+## Run 4 — LibriSpeech dev-clean, real-data training (interrupted at step 500)
+
+`uv run python scripts/train_stage1.py --steps 5000` (defaults: batch_size=64,
+lr=1e-4, grad_clip_norm=1.0, `dev-clean`).
+
+Train loss (noisy batch-to-batch, different 64 real utterances every step):
+15.20 (step 0) -> dips and a 100-300 step plateau around 5.6-5.9 -> resumes
+descending from step 350 -> 4.61 (step 500). `wav` component stayed flat/
+noisy the whole run (0.037-0.064, no net improvement). Held-out fixed-clip
+val loss: 15.5154 (step 0) -> **5.3295 (step 500, new best)**, a 65.7% drop.
+
+**Listening result (user): `val_step500.wav` is noise, not recognizable
+speech** — `val_step0.wav` was silence. Loss dropping while the reconstruction
+stays unintelligible is the central open problem right now; training was
+paused (~step 800) to investigate with a cleaner, cheaper test before
+spending more wall-clock time on the full dataset run.
+
+---
+
+## Run 5 — Real-clip overfit test (single real LibriSpeech utterance)
+
+Motivation: isolate whether the noise problem is a *generalization* issue
+(hard to learn across thousands of diverse real utterances in ~500-800
+steps) or a more fundamental *architecture/loss* issue that would show up
+even in the easiest possible setting — memorizing one fixed real clip, no
+generalization required at all. Added `--source real` to
+`scripts/sanity_overfit.py` (loads the same fixed clip, `dataset[0]` from
+`dev-clean`, that `train_stage1.py` uses for its held-out sample).
+
+`uv run python scripts/sanity_overfit.py --source real --steps 500`:
+
+```text
+initial loss: 17.3089
+final loss:    3.6588
+best loss:     3.6419  (step 498)
+reduction (best): 79.0%
+max grad norm (pre-clip): 885.451
+avg step time (steady-state): 2340.7 ms  (0.43 steps/sec)
+```
+
+**Result: loss reduction (79.0%) is the best of any run so far — better than
+the synthetic overfit (70.5%) and the real-data training run's val loss
+(65.7%) — but the user reports the audio is still noise, not recognizable
+speech** (envelope/amplitude pattern looked similar, content did not).
+
+### Analysis
+
+This is the most decisive result yet, because it rules out the
+"not-enough-steps-to-generalize" explanation entirely: with zero
+generalization required (one fixed clip, repeated every step), the model
+still cannot produce intelligible speech, despite achieving its lowest loss
+of any experiment. The problem is not (or not only) about training budget —
+it reproduces at the easiest possible task.
+
+**Key new data point: `max grad norm (pre-clip)` jumped from 104.291 (Run 3,
+synthetic tone) to 885.451 (Run 5, real speech) — 8.5x higher, same
+architecture, same hyperparameters, same clip length, only the target signal
+changed.** This reopens the gradient-norm investigation from Run 3 with a
+sharper question: real speech's sharp transients (vs. the smooth synthetic
+tone) are clearly implicated — the diagnostic instrumentation proposed after
+Run 3 (per-block grad norms, tau/alpha logging) is now the direct next step,
+run on this exact real clip, to find out which block is actually responsible
+before touching any code.
+
+---
+
+## Run 6 — Per-block gradient / tau-alpha diagnostics on the real clip
+
+Added `ContinuousTimeCell.start_recording()/stop_recording()` (accumulates
+per-step tau/alpha values) and `scripts/diagnose_gradients.py` (splits
+gradient norm into 17 groups: encoder/decoder x {fast,mid,slow} x
+{time_constant, candidate}, plus cross-connections, frontend, head, and
+generator). Verified without training that the grouping covers all
+3,888,129 parameters with nothing falling into an `other` bucket.
+
+`uv run python scripts/diagnose_gradients.py --source real --steps 200`
+(same real clip as Run 5):
+
+```text
+step    0  total 17.3089   generator=26.645   (all *.tau groups: 0.001-0.044, smallest of all groups)
+step   25  total  9.0537   generator=636.596  (all *.tau groups: 0.004-0.248, still smallest)
+step   50  total  7.3938   generator=316.713  (all *.tau groups: 0.003-0.182, still smallest)
+```
+
+Tau/alpha values themselves stayed in sane, stable ranges throughout (e.g.
+`encoder.fast` tau ~0.044-0.046s, alpha ~0.80; `decoder.slow` tau ~1.3-3.8s,
+alpha ~0.99) — no branch's time constant collapsed to its boundary or
+exploded.
+
+### Analysis
+
+**The tau hypothesis from Run 3/5 is refuted by direct measurement.** Every
+`*.tau` group (the `time_constant` linear layers, across all 6 branches) has
+the *smallest* gradient norm of every group at every logged step — the
+opposite of what the `d(alpha)/d(tau) ~ 1/tau^2` analysis predicted would
+dominate. The analytical concern about the fast branch's boundary
+sensitivity was reasonable but empirically wrong as an explanation here.
+
+**`generator` gradient norm dominates completely and matches the scale of
+the problem:** 26.6 -> 636.6 -> 316.7 across the first 50 steps, one to two
+orders of magnitude above every other group (next-largest around 15-17). At
+step 25 alone it nearly reproduces the 885 aggregate max norm seen in Run 5.
+
+**New hypothesis: the log-compression epsilon in `ReconstructionLoss` is too
+small.** `docs/../src/aevum/training/losses/reconstruction.py` computes
+`log(mag + eps)` with `eps=1e-5` (mel) / `1e-7` (multi-res STFT) on the
+*predicted* magnitude spectrogram. At initialization the generator's output
+is near-zero everywhere, so predicted magnitude is near-zero across most
+time-frequency bins; the L1 gradient through `log(mag_hat + eps)` behaves
+like `1/(mag_hat + eps)`, which explodes as `mag_hat -> 0`. Real speech's
+broadband/transient content (fricatives, plosives, noise bursts) carries
+real target energy across far more frequency bins than the synthetic tone's
+3 narrow harmonics — plausibly explaining both *why* it's the generator
+specifically (it's the only block whose output feeds directly into the
+mel/STFT magnitude computation) and *why* real speech produces an 8.5x
+larger blow-up than the synthetic tone (more bins with a large near-zero-vs.
+-real-energy mismatch).
+
+This also offers a candidate explanation for the noisy output itself: with
+clipping engaged almost every step, the update *direction* is dominated by
+this generator-eps artifact rather than by the comparatively tiny,
+presumably more meaningful gradient signal from other blocks — the model may
+be spending most of its optimization budget reacting to a loss-function
+artifact rather than learning correct speech structure.
+
+### Next step (proposed, not yet run)
+
+Increase `eps` in `ReconstructionLoss` (e.g. `1e-5`/`1e-7` -> `1e-2`, or an
+equivalent softer compression) and re-run `diagnose_gradients.py --source
+real` to check whether `generator`'s gradient norm drops to a sane range. If
+it does, re-run the real-clip overfit test (Run 5) to check whether the
+reconstruction actually becomes intelligible speech this time, before
+returning to the full LibriSpeech training run.
+
+---
