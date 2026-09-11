@@ -455,3 +455,85 @@ actually matters — a well-behaved gradient norm is necessary but not
 sufficient proof that the underlying noise problem is fixed.
 
 ---
+
+## Run 8 — Real-clip overfit, eps=1e-2 (500 steps)
+
+`uv run python scripts/sanity_overfit.py --source real --steps 500`, same
+real clip as Runs 5-7, with the fixed eps.
+
+```text
+step    0  total 5.5930  wav 0.0513  mel 2.7737  stft 2.7680  grad_norm  18.843
+step   75  total 5.2155  wav 0.0824  mel 2.0624  stft 3.0707  grad_norm 153.114  <- one-off spike
+step  100  total 3.7905  wav 0.0482  mel 1.7667  stft 1.9757  grad_norm   6.917
+step  200  total 2.7137  wav 0.0469  mel 1.1045  stft 1.5623  grad_norm  10.611
+step  300  total 2.4750  wav 0.0482  mel 0.9707  stft 1.4561  grad_norm  20.836
+step  400  total 2.2282  wav 0.0489  mel 0.8294  stft 1.3499  grad_norm  31.685
+step  499  total 2.0672  wav 0.0482  mel 0.7407  stft 1.2784  grad_norm  25.281
+
+best loss: 2.0229 (step 484), reduction (best) 63.8%
+max grad norm (pre-clip): 162.919
+```
+
+Grad norm oscillates (one spike to 153 around step 75, otherwise mostly
+single-to-low-double digits) but never returns to the old exploding regime
+(compare to Run 5's 885 max) — consistent with Run 7's diagnostic. `wav`
+stayed essentially flat the entire run (0.0513 -> 0.0482, no real
+improvement) while `mel`/`stft` improved steadily and substantially.
+
+**Listening result (user): still the same noise as before the eps fix.**
+
+### Analysis
+
+The eps fix is confirmed necessary but not sufficient: gradients are now
+healthy, loss reduction is the cleanest/most monotonic of any real-data run
+(63.8%), and the problem persists unchanged. This rules out gradient
+explosion as *the* cause of the noise — it was a real, worth-keeping fix,
+but not the answer to the actual question we care about.
+
+The flat `wav` loss throughout (here and in every previous run) is the
+strongest clue: `mel` and multi-res `stft` are magnitude-only losses —
+literally blind to phase — and `wav` L1 isn't providing enough signal to
+constrain phase either. This matches the classical "phase reconstruction
+problem": matching a magnitude spectrogram exactly does not by itself
+determine a clean waveform, and a model can satisfy magnitude losses while
+producing something with correct short-term spectral energy but incoherent
+phase across frames — which sounds like noise.
+
+### Next step — cleanest possible isolating experiment
+
+Rather than continue reasoning about tau/gradients/cross-connections/latent
+dimensions, the proposal (from the user) is to ask one binary question
+directly: **can `generator` alone synthesize this real clip at all**, given
+the easiest possible input? Implemented in
+`scripts/overfit_generator_only.py`: throw out frontend, encoder, continuous
+dynamics, and decoder entirely; replace them with a fully free, directly
+learnable latent tensor `Z in R^{1 x 384 x 200}` (one independent vector per
+100 Hz frame, no bottleneck of any kind — "cheat code": 76,800 free
+parameters to describe one 2-second clip). Train `Z` jointly with
+`generator`'s own parameters, same reconstruction loss.
+
+```text
+learnable Z [1, 384, 200] -> generator -> wav -> ReconstructionLoss
+```
+
+- **Result A (still noise after a few thousand steps):** encoder and
+  continuous dynamics are fully exonerated — the problem is either
+  `generator`'s architecture or the reconstruction loss itself. Distinguish
+  those two with `scripts/check_phase_problem.py` (already written,
+  not yet run): reconstruct the *target*'s own true magnitude spectrogram
+  via Griffin-Lim (discarding true phase, no model involved at all). If that
+  also sounds noisy/metallic, the loss formulation (magnitude-only,
+  phase-blind) is the shared root cause of both failures. If it sounds
+  clean, `generator`'s architecture specifically is the deficient part.
+- **Result B (clean/near-original speech):** `generator` is fine; the
+  bottleneck is upstream — something about how the
+  encoder/dynamics/decoder chain compresses information into the latent it
+  hands to the generator.
+
+This also runs much faster per step than every previous experiment: it
+skips both 200-step sequential Python recurrence loops (encoder + decoder),
+leaving only a fixed-depth conv stack.
+
+Command: `uv run python scripts/overfit_generator_only.py --steps 3000`.
+
+---
