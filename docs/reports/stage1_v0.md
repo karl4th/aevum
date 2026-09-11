@@ -625,9 +625,53 @@ reconstruction. The bottleneck is now narrowed specifically to
 turns real audio into `z_t` in the first place) — the only part of the
 full pipeline not yet tested in isolation.
 
-### Next step
+### Next step — encoder+generator isolation, and a standing hypothesis about the interface
 
-User has a specific idea for the next isolating experiment targeting the
-encoder side specifically — to be run next.
+`scripts/overfit_encoder_generator.py` (not yet run): removes the free-latent
+"cheat" and the decoder both. Real audio goes through `frontend -> encoder
+dynamics -> encoder head -> generator`, no decoder at all:
+
+```text
+real audio -> frontend -> encoder dynamics -> encoder head -> generator -> wav
+```
+
+The emerging picture, if this is also clean:
+
+```text
+free latent -> generator                 (Run 9)   clean
+free latent -> decoder -> generator       (Run 10)  clean
+audio -> encoder -> generator             (this)    clean?
+audio -> encoder -> decoder -> generator  (full)     noise
+```
+
+That pattern would mean the problem is not any single block's capacity but
+the **encoder-decoder interface**. User's specific hypothesis: `decoder`'s
+leaky-integrator update (`d_t = alpha_t*d_{t-1} + (1-alpha_t)*f(z_t,
+d_{t-1})`) forces each `z_t` to "leak" into the state over several steps.
+A *free* latent Z can pre-compensate for this during its own training (it's
+optimized jointly with the decoder from scratch to already account for that
+smoothing). A real encoder instead has to simultaneously (a) analyze the
+waveform, (b) build a meaningful instantaneous state, (c) anticipate how the
+decoder will subsequently distort/smear that representation over time, and
+(d) push all of that through a recurrent bottleneck — a much harder joint
+optimization problem than either side solved separately.
+
+**Candidate fix (explicitly not implemented yet — encoder+generator test
+comes first):** a direct residual/skip highway from the encoder latent to
+the generator input, alongside the decoder path:
+
+```text
+y_t = W_d[d_t^F; d_t^M; d_t^S] + W_skip * z_t
+```
+
+i.e. `encoder z_t` feeds `generator` both through `decoder` (for temporal
+context / autonomous evolution between events) and directly (so decoder is
+not the *only* channel for current information). This is the user's leading
+hypothesis for the eventual fix, contingent on the encoder+generator test
+result below.
+
+Command: `uv run python scripts/overfit_encoder_generator.py --steps 3000`
+(watch closely in the first 300-500 steps — no need to wait for completion
+if the result is already clear, same as Run 10).
 
 ---
