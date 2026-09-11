@@ -675,3 +675,66 @@ Command: `uv run python scripts/overfit_encoder_generator.py --steps 3000`
 if the result is already clear, same as Run 10).
 
 ---
+
+## Run 11 — Encoder+generator isolation test: diverges (new failure mode)
+
+`uv run python scripts/overfit_encoder_generator.py --steps 3000` (real
+audio -> frontend -> encoder fast/mid/slow -> encoder head -> generator, no
+decoder, no free latent):
+
+```text
+step    0  total  5.4316  wav 0.0457  mel 2.7508  stft 2.6351  grad_norm    8.925
+step  100  total  5.2396  wav 0.0453  mel 2.6469  stft 2.5473  grad_norm   16.403
+step  125  total  5.0412  wav 0.0459  mel 2.5922  stft 2.4031  grad_norm   12.326
+step  150  total  4.4249  wav 0.0586  mel 2.0304  stft 2.3359  grad_norm  378.710
+step  175  total 11.4930  wav 0.3314  mel 2.3777  stft 8.7839  grad_norm 1649.750
+step  200  total  4.9378  wav 0.0739  mel 2.1947  stft 2.6692  grad_norm  641.721
+step  225  total 22.5702  wav 0.8290  mel 2.7780  stft 18.9632 grad_norm  981.581
+```
+(stopped early by the user — clearly diverging, no need to run further)
+
+### Analysis
+
+**A new, different failure mode.** Steps 0-125 look fine (loss trending
+down slowly, grad_norm in the teens). Starting at step 150, grad_norm
+explodes (378 -> 1650 -> 642 -> 982) and loss gets *worse* than at step 0 by
+step 225 (22.57 vs 5.43). This is the first time this kind of instability
+has appeared with `generator` in the loop *and* the fixed eps in place —
+Runs 9 and 10 (free latent feeding generator / decoder+generator) never
+showed anything like it, and they used the exact same generator,
+reconstruction loss, LR, and clipping. The only thing different here is
+that `generator` is now downstream of the encoder's real fast/mid/slow
+continuous-time recurrence being trained on real audio, instead of a free,
+directly-optimizable per-frame tensor.
+
+This reopens (in a more specific form) the gradient-explosion question from
+Runs 5-7 — this time implicating the encoder's *recurrent* dynamics
+specifically (not tau in isolation, which Run 6 already cleared; possibly
+the interaction between the recurrence and the generator once the encoder
+is actually forced to represent real transient-heavy audio, rather than
+tau, candidate, or generator weights on their own).
+
+### Next step — strip the recurrence specifically
+
+`scripts/overfit_frontend_generator.py` (not yet run): keep the real causal
+`frontend` and `generator`, but replace the fast/mid/slow continuous-time
+dynamics with a trivial per-frame linear projection (`Conv1d` with
+`kernel_size=1` — no cross-timestep dependency beyond what the causal
+frontend already has):
+
+```text
+real audio -> frontend -> Linear(384, 384) per frame -> generator -> wav
+```
+
+- **Result A (fast, clean, no explosion):** frontend and generator are both
+  fine on real audio; the problem is specifically the encoder's
+  continuous-time recurrent dynamics (`ContinuousTimeCell`) — next step
+  would be taking that cell apart directly rather than testing more
+  end-to-end combinations.
+- **Result B (explodes/noisy again):** the problem is upstream of any
+  recurrence — the frontend itself, its lack of normalization, stride/
+  alignment, or the frontend->generator interface.
+
+Command: `uv run python scripts/overfit_frontend_generator.py --steps 2000`.
+
+---
