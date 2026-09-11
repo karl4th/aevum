@@ -1320,6 +1320,39 @@ holds end-to-end, before deciding whether to update the actual
 still reflect the pre-fix design) or continue iterating via standalone
 scripts.
 
+**Listening result (user, at step 500/2000, loss 0.6438):** minor
+crackling/hoarseness, otherwise the same as target. Consistent with just
+needing more steps, not a new problem — every prior single-branch +
+residual test only reached clean "identical to target" quality around loss
+0.3-0.4 (Run 16: 0.3473, Run 17: 0.3466, Run 18: 0.3412), and this combined
+run was stopped well short of that range. User's call: sufficient
+confirmation to move on to the full pipeline test.
+
+---
+
+## Run 20 (setup) — `scripts/overfit_full_pipeline_v2.py` written
+
+Reassembles the complete pipeline with the fixed encoder:
+`audio -> frontend -> {fast,mid,slow}+direct path (gated fusion) -> z_t ->
+ContinuousDecoder -> generator -> wav`. Encoder side matches Run 19 exactly
+(`candidate_uses_hidden=False`, full adaptive tau, no cross-timescale
+connections, gates init 0.1, `W_x` identity-initialized); `ContinuousDecoder`
+and `generator` are the unmodified `aevum.models` classes (both cleared in
+Runs 9/10).
+
+Verified with a 2-step smoke run: runs cleanly, no shape/runtime errors,
+sane loss and grad_norm (5.53, then 6.98 — some step-to-step noise expected
+this early, matching the pattern seen in every other run at step 0-1).
+
+This is the test that matters most: it directly repeats the original
+Run 4/5/8 setup (which produced noise) with the only change being the fixed
+encoder. If this reconstructs clean speech, the root-cause diagnosis and
+fix from Runs 11-19 are confirmed end-to-end.
+
+Command: `uv run python scripts/overfit_full_pipeline_v2.py --steps 2000`
+(slower per step than Run 19 — adds `ContinuousDecoder`'s own sequential
+200-step loop on top of the three-branch encoder loop).
+
 ---
 
 ## Cross-project note
