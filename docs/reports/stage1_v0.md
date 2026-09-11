@@ -1135,3 +1135,45 @@ Command: `uv run python scripts/overfit_single_branch.py --branch mid
 formula).
 
 ---
+
+## Run 17 — `mid` + direct residual + adaptive tau restored: still clean
+
+`uv run python scripts/overfit_single_branch.py --branch mid
+--no-self-recurrence --direct-residual --steps 1000` (full adaptive
+`tau_t = f(x_t, h_{t-1})` restored; only `candidate_uses_hidden=False`
+and the direct residual carry over from Run 16):
+
+```text
+step    0  total 5.3890  grad_norm  6.947
+step  250  total 1.1334  grad_norm 10.540
+step  500  total 0.5953  grad_norm 10.815
+step  750  total 0.4787  grad_norm  9.290
+step  999  total 0.3775  grad_norm  5.642
+best loss: 0.3466 (93.6% reduction)
+```
+
+`grad_norm` stayed calm throughout (4-17 range, same as Run 16 with fixed
+tau) — restoring adaptive tau did not reintroduce any instability once the
+direct residual is in place. Best loss (0.3466) essentially matches Run
+16's fixed-tau result (0.3473).
+
+### Analysis
+
+**Step 1 of the recovery plan succeeds.** Adaptive tau is not inherently
+dangerous — it only became a problem (Run 6/7's tau hypothesis, later
+superseded) when `mid`/`slow` states were also required to be the sole
+transport channel. With the direct residual removing that burden, the full
+original `tau_t = f(x_t, h_{t-1})` formula is safe to keep. This recovers
+AEVUM's dynamic-temporal-resolution capability without the instability.
+
+### Next step
+
+Per the plan: same test on `slow` (`--branch slow --no-self-recurrence
+--direct-residual`, full adaptive tau). `slow` no longer needs to carry
+speech itself — this checks whether it can now safely do its intended job
+(long memory) without exploding, now that residual handles transport.
+
+Command: `uv run python scripts/overfit_single_branch.py --branch slow
+--no-self-recurrence --direct-residual --steps 1000`.
+
+---
