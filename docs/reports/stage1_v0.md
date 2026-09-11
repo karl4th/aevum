@@ -1277,6 +1277,51 @@ slower per step than the single-branch tests — three sequential
 
 ---
 
+## Run 19 — Full fast+mid+slow encoder + gated fusion: stopped early, looks clean
+
+`uv run python scripts/overfit_multiscale_encoder.py --steps 2000`, stopped
+at step 500/2000 — same stopping-early judgment call as Runs 10/12 (trend
+already unambiguous):
+
+```text
+step    0  total 5.7583  grad_norm 24.081  g_fast=0.1010 g_mid=0.1010 g_slow=0.0990
+step  100  total 3.1198  grad_norm  7.294  g_fast=0.0916 g_mid=0.0963 g_slow=0.0870
+step  250  total 1.4295  grad_norm 11.950  g_fast=0.0881 g_mid=0.1040 g_slow=0.0814
+step  400  total 0.8822  grad_norm 10.307  g_fast=0.0900 g_mid=0.1054 g_slow=0.0794
+step  500  total 0.6746  grad_norm 10.186  g_fast=0.0902 g_mid=0.1058 g_slow=0.0778
+best loss: 0.6438 (88.8% reduction at the 25% mark)
+```
+
+`grad_norm` stayed calm (3-12) the entire run — no explosions with all
+three branches training simultaneously. Gates stayed near their 0.1 init
+throughout (0.078-0.106 range) rather than collapsing to zero or
+runaway-growing, meaning all three branches are contributing without any
+one dominating pathologically. Trajectory closely tracks the single-branch
+`mid`/`slow` + residual results (Run 17/18) at the same step count.
+
+### Analysis
+
+Consistent with success — matches every prior indicator that the direct
+residual + small-init gated fusion generalizes cleanly from single branches
+to the full three-branch encoder. Awaiting listening confirmation on
+`outputs/multiscale_encoder/recon_best.wav` before declaring the Stage 1
+encoder architecture found (per this report's own established discipline:
+loss trends alone were misleading multiple times earlier in this
+investigation, e.g. Run 5).
+
+### Next step
+
+If listening confirms clean/intelligible speech: the Stage 1 encoder
+architecture is considered found. Then: reintroduce `ContinuousDecoder` and
+repeat the full `audio -> encoder -> decoder -> generator` sanity test
+(originally Run 4/5/8, where noise was first observed) to confirm the fix
+holds end-to-end, before deciding whether to update the actual
+`aevum.models` package (currently `ContinuousEncoder`/`autoencoder.py`
+still reflect the pre-fix design) or continue iterating via standalone
+scripts.
+
+---
+
 ## Cross-project note
 
 The general lesson from Runs 11-18 (a slow-decaying continuous-time state
