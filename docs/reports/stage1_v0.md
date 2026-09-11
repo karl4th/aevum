@@ -738,3 +738,88 @@ real audio -> frontend -> Linear(384, 384) per frame -> generator -> wav
 Command: `uv run python scripts/overfit_frontend_generator.py --steps 2000`.
 
 ---
+
+## Run 12 — Frontend+generator isolation test: Result A (recurrence implicated)
+
+`uv run python scripts/overfit_frontend_generator.py --steps 2000` (real
+audio -> frontend -> per-frame `Linear(384,384)` -> generator, no
+recurrence at all). Stopped early at step 875 — result already clear:
+
+```text
+step    0  total 5.4029  wav 0.0441  mel 2.7378  stft 2.6210  grad_norm  7.009
+step  200  total 1.6089  wav 0.0511  mel 0.5867  stft 0.9711  grad_norm  9.563
+step  500  total 0.6803  wav 0.0413  mel 0.1582  stft 0.4807  grad_norm  6.954
+step  875  total 0.3997  wav 0.0274  mel 0.0768  stft 0.2955  grad_norm  4.889  best 0.3968
+```
+
+`grad_norm` stayed in single-to-low-double digits (5-28) the entire run —
+no explosion, unlike Run 11 (which spiked 378->1650->642->982 by step 225
+using the exact same frontend and generator, only with the fast/mid/slow
+recurrence added back in).
+
+### Analysis — full isolation matrix
+
+```text
+free latent -> generator                    clean  (Run 9)
+free latent -> decoder -> generator          clean  (Run 10)
+audio -> frontend -> Linear -> generator      clean  (this, Run 12)
+audio -> frontend -> encoder(f/m/s) -> gen     diverges  (Run 11)
+audio -> encoder -> decoder -> generator        noise  (Run 4/5/8, full pipeline)
+```
+
+Frontend, generator, and `ContinuousDecoder` are all individually cleared.
+**The encoder's continuous-time recurrence (`ContinuousTimeCell` /
+fast-mid-slow dynamics), specifically when trained on real audio rather
+than a free tensor, is the common factor in every failing configuration.**
+
+### Next step — which branch, and a proposed architectural fix
+
+User's next test, grounded directly in the tau/alpha values measured in
+Run 6/7 (alpha_fast~0.80, alpha_mid~0.964, alpha_slow~0.996 — i.e.
+1-alpha = 20% / 3.6% / 0.4% new information admitted per 10 ms step): test
+each branch **alone**, no cross-timescale connections, to see whether
+severity of the problem tracks branch "speed":
+
+```text
+real audio -> frontend -> ONE ContinuousTimeCell (fast|mid|slow) -> per-frame projection -> generator -> wav
+```
+
+Prediction: `fast` should still permit reasonable reconstruction; `mid`
+should be noticeably worse; `slow` should turn speech to mush — because a
+state with alpha~0.996 can only admit ~0.4% new information per step, which
+is a severe low-pass if it's also the *only* channel current acoustic
+information must travel through to reach the generator.
+
+Implemented in `scripts/overfit_single_branch.py --branch {fast,mid,slow}`
+(500-1000 steps each is expected to be enough).
+
+**Proposed architectural diagnosis (not yet implemented):** the continuous
+states are currently forced to serve two different jobs at once — *what to
+remember* (context/memory) and *how to transport all current acoustic
+information downstream* (transport channel) — and those are different
+jobs. A heavily-smoothed slow state may be exactly right for memory, but
+wrong as the sole transport path for fast-changing detail. Proposed fix,
+mirroring the decoder-side residual-highway idea from Run 10's analysis but
+on the encoder side:
+
+```text
+z_t = W_instant * f_t + W_F*h_t^F + W_M*h_t^M + W_S*h_t^S
+```
+
+i.e. add a direct instantaneous path from the frontend feature `f_t`
+straight into the fused latent, alongside (not instead of) the fast/mid/
+slow states — so `f_t` carries consonants/transients/formant-transitions
+that must not be smoothed, while the continuous dynamics contribute context,
+speaker trajectory, rhythm, and predictive memory on top. This also
+reframes continuous dynamics' role for the eventual event-driven codec: not
+the transport channel for signal, but temporal memory layered over an
+instantaneous representation — innovation (`e_t = z_t - z_hat_t`) should be
+measurable before the encoder has a chance to smooth it away.
+
+Planned test sequence: (1) the three single-branch ablations above to
+confirm the low-pass-severity hypothesis experimentally, then (2) full
+multi-timescale (with cross-connections) *plus* the direct residual
+highway, to check whether that combination restores clean reconstruction on
+the complete system.
+
+---
