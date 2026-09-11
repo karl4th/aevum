@@ -10,7 +10,7 @@ from torch import nn
 class MultiResolutionSTFTLoss(nn.Module):
     """Sum of spectral-convergence + log-magnitude losses across several FFT sizes."""
 
-    def __init__(self, fft_sizes: tuple[int, ...] = (256, 512, 1024, 2048), eps: float = 1e-7) -> None:
+    def __init__(self, fft_sizes: tuple[int, ...] = (256, 512, 1024, 2048), eps: float = 1e-2) -> None:
         super().__init__()
         self.fft_sizes = fft_sizes
         self.eps = eps
@@ -43,7 +43,7 @@ class ReconstructionLoss(nn.Module):
         wav_weight: float = 1.0,
         mel_weight: float = 1.0,
         stft_weight: float = 1.0,
-        eps: float = 1e-5,
+        eps: float = 1e-2,
     ) -> None:
         super().__init__()
         self.wav_weight = wav_weight
@@ -54,7 +54,9 @@ class ReconstructionLoss(nn.Module):
         self.mel = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate, n_fft=1024, hop_length=240, n_mels=n_mels
         )
-        self.stft_loss = MultiResolutionSTFTLoss()
+        # Shared eps: both are instances of the same log(mag + eps) w.r.t. predicted
+        # magnitude near zero -> 1/(mag_hat + eps) blow-up (docs/reports/stage1_v0.md, Run 6).
+        self.stft_loss = MultiResolutionSTFTLoss(eps=eps)
 
     def forward(self, x: torch.Tensor, x_hat: torch.Tensor) -> dict[str, torch.Tensor]:
         """``x``, ``x_hat``: ``[B, 1, samples]``."""
