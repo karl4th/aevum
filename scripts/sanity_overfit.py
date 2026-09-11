@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 import torchaudio
 
+from aevum.data.librispeech import LibriSpeechSegments
 from aevum.models.autoencoder import DenseContinuousAutoencoder
 from aevum.training.losses.reconstruction import ReconstructionLoss
 
@@ -36,15 +37,33 @@ def make_synthetic_clip(seconds: float, batch_size: int, device: torch.device) -
     return signal.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1)
 
 
+def load_real_clip(
+    data_root: str, librispeech_url: str, index: int, seconds: float, batch_size: int, device: torch.device
+) -> torch.Tensor:
+    """One fixed real LibriSpeech utterance, repeated across the batch dim.
+
+    Uses the same dataset/index convention as train_stage1.py's held-out
+    validation clip (index 0), so results are directly comparable.
+    """
+    dataset = LibriSpeechSegments(root=data_root, url=librispeech_url, segment_seconds=seconds, download=True)
+    torch.manual_seed(0)
+    clip = dataset[index]  # [1, samples], fixed crop given the seed above
+    return clip.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Overfit sanity check for the Stage 1 autoencoder")
+    parser.add_argument("--source", choices=["synthetic", "real"], default="synthetic")
+    parser.add_argument("--data-root", type=str, default="data/raw")
+    parser.add_argument("--librispeech-url", type=str, default="dev-clean")
+    parser.add_argument("--real-index", type=int, default=0)
     parser.add_argument("--seconds", type=float, default=2.0)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=25)
-    parser.add_argument("--out-dir", type=str, default="outputs/sanity")
+    parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -55,11 +74,14 @@ def main() -> None:
     criterion = ReconstructionLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    waveform = make_synthetic_clip(args.seconds, args.batch_size, device)
+    if args.source == "real":
+        waveform = load_real_clip(args.data_root, args.librispeech_url, args.real_index, args.seconds, args.batch_size, device)
+    else:
+        waveform = make_synthetic_clip(args.seconds, args.batch_size, device)
     num_frames = waveform.shape[-1] // model.total_stride
     waveform = waveform[:, :, : num_frames * model.total_stride]
 
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/sanity_{args.source}")
     out_dir.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(out_dir / "target.wav"), waveform[0].cpu(), SAMPLE_RATE)
 
@@ -119,7 +141,7 @@ def main() -> None:
     print(f"reduction (best):  {100 * (1 - best_loss / initial_loss):.1f}%")
     print(f"max grad norm (pre-clip): {max(grad_norms):.3f}")
     print(f"avg step time (steady-state): {avg_step_time * 1000:.1f} ms  ({1 / avg_step_time:.2f} steps/sec)")
-    print(f"batch_size={args.batch_size} seconds={args.seconds} frames={num_frames}")
+    print(f"source={args.source} batch_size={args.batch_size} seconds={args.seconds} frames={num_frames}")
     print(f"samples written to: {out_dir}")
 
 

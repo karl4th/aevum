@@ -23,6 +23,25 @@ class ContinuousTimeCell(nn.Module):
         self.candidate = nn.Linear(input_dim + hidden_dim, hidden_dim)
         self.time_constant = nn.Linear(input_dim + hidden_dim, hidden_dim)
 
+        self._recording = False
+        self._tau_log: list[torch.Tensor] = []
+        self._alpha_log: list[torch.Tensor] = []
+
+    def start_recording(self) -> None:
+        """Begin accumulating per-step tau/alpha values (for diagnostics only)."""
+        self._recording = True
+        self._tau_log = []
+        self._alpha_log = []
+
+    def stop_recording(self) -> dict[str, torch.Tensor]:
+        """Stop accumulating and return the flattened tau/alpha values seen since ``start_recording``."""
+        self._recording = False
+        tau = torch.cat(self._tau_log) if self._tau_log else torch.empty(0)
+        alpha = torch.cat(self._alpha_log) if self._alpha_log else torch.empty(0)
+        self._tau_log = []
+        self._alpha_log = []
+        return {"tau": tau, "alpha": alpha}
+
     def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor, dt: float) -> torch.Tensor:
         """Advance the state by one observation step of size ``dt`` seconds.
 
@@ -38,4 +57,9 @@ class ContinuousTimeCell(nn.Module):
         u_t = torch.tanh(self.candidate(xh))
         tau_t = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.time_constant(xh))
         alpha_t = torch.exp(-dt / tau_t)
+
+        if self._recording:
+            self._tau_log.append(tau_t.detach().flatten())
+            self._alpha_log.append(alpha_t.detach().flatten())
+
         return alpha_t * h_prev + (1 - alpha_t) * u_t
