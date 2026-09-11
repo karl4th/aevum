@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data & experiment artifacts
+data/**
+!data/**/.gitkeep
+outputs/
+logs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

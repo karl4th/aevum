@@ -1,0 +1,20 @@
+[project]
+name = "aevum"
+version = "0.1.0"
+description = "AEVUM — a neural codec by Manifestro"
+readme = "README.md"
+authors = [
+    { name = "karl4th", email = "bagzhankarl@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
