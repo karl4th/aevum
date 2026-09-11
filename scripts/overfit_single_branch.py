@@ -61,6 +61,17 @@ def main() -> None:
         action="store_true",
         help="drop h_{t-1} from the candidate's own input (u_t = phi(W_x x_t) instead of phi(W_x x_t + W_hh h_{t-1})); tests the double-recurrence/positive-feedback hypothesis from Run 13",
     )
+    parser.add_argument(
+        "--fixed-tau",
+        type=float,
+        default=None,
+        help="replace the learned adaptive tau network with this constant (e.g. 0.275 for mid's range midpoint); tests the h_{t-1}->tau_t->alpha_t->h_t feedback hypothesis from Run 14",
+    )
+    parser.add_argument(
+        "--tau-input-only",
+        action="store_true",
+        help="keep tau adaptive/learned but drop h_{t-1} from its input (tau_t = f(x_t) instead of f(x_t, h_{t-1})); run only after --fixed-tau, not at the same time (per Run 14 plan)",
+    )
     parser.add_argument("--data-root", type=str, default="data/raw")
     parser.add_argument("--librispeech-url", type=str, default="dev-clean")
     parser.add_argument("--index", type=int, default=0)
@@ -78,10 +89,20 @@ def main() -> None:
 
     target = load_real_clip(args.data_root, args.librispeech_url, args.index, args.seconds, device)
 
+    if args.fixed_tau is not None and args.tau_input_only:
+        raise ValueError("--fixed-tau and --tau-input-only are separate experiments -- run one at a time")
+
     frontend = CausalAcousticFrontend().to(device)
     tau_min, tau_max = BRANCH_TAU_RANGES[args.branch]
     cell = ContinuousTimeCell(
-        frontend.output_dim, BRANCH_HIDDEN_DIM, tau_min, tau_max, candidate_uses_hidden=not args.no_self_recurrence
+        frontend.output_dim,
+        BRANCH_HIDDEN_DIM,
+        tau_min,
+        tau_max,
+        candidate_uses_hidden=not args.no_self_recurrence,
+        adaptive_tau=args.fixed_tau is None,
+        tau_uses_hidden=not args.tau_input_only,
+        fixed_tau=args.fixed_tau,
     ).to(device)
     projection = nn.Conv1d(BRANCH_HIDDEN_DIM, frontend.output_dim, kernel_size=1).to(device)
     generator = CausalWaveformGenerator(input_dim=frontend.output_dim).to(device)
@@ -93,13 +114,20 @@ def main() -> None:
     param_count = sum(p.numel() for m in modules for p in m.parameters())
     print(
         f"branch={args.branch} tau_range=({tau_min},{tau_max}) hidden_dim={BRANCH_HIDDEN_DIM} "
-        f"candidate_uses_hidden={not args.no_self_recurrence} params={param_count:,}"
+        f"candidate_uses_hidden={not args.no_self_recurrence} adaptive_tau={args.fixed_tau is None} "
+        f"fixed_tau={args.fixed_tau} tau_uses_hidden={not args.tau_input_only} params={param_count:,}"
     )
 
     criterion = ReconstructionLoss().to(device)
     optimizer = torch.optim.AdamW([p for m in modules for p in m.parameters()], lr=args.lr)
 
-    suffix = "_no_self_rec" if args.no_self_recurrence else ""
+    suffix = ""
+    if args.no_self_recurrence:
+        suffix += "_no_self_rec"
+    if args.fixed_tau is not None:
+        suffix += f"_fixed_tau{args.fixed_tau}"
+    if args.tau_input_only:
+        suffix += "_tau_input_only"
     out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/single_branch_{args.branch}{suffix}")
     out_dir.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(out_dir / "target.wav"), target[0].detach().cpu(), SAMPLE_RATE)

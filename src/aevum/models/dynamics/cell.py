@@ -21,12 +21,18 @@ class ContinuousTimeCell(nn.Module):
         tau_min: float = 0.005,
         tau_max: float = 5.0,
         candidate_uses_hidden: bool = True,
+        adaptive_tau: bool = True,
+        tau_uses_hidden: bool = True,
+        fixed_tau: float | None = None,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.tau_min = tau_min
         self.tau_max = tau_max
         self.candidate_uses_hidden = candidate_uses_hidden
+        self.adaptive_tau = adaptive_tau
+        self.tau_uses_hidden = tau_uses_hidden
+        self.fixed_tau = fixed_tau
 
         # candidate_uses_hidden=False drops h_{t-1} from the candidate's own input,
         # so old state re-enters the update only through the alpha-weighted memory
@@ -35,7 +41,19 @@ class ContinuousTimeCell(nn.Module):
         # source of the mid/slow branch gradient explosions).
         candidate_input_dim = input_dim + hidden_dim if candidate_uses_hidden else input_dim
         self.candidate = nn.Linear(candidate_input_dim, hidden_dim)
-        self.time_constant = nn.Linear(input_dim + hidden_dim, hidden_dim)
+
+        # adaptive_tau=False replaces the learned tau network with a constant, so
+        # h_{t-1} can no longer influence its own decay rate at all (the
+        # h_{t-1} -> tau_t -> alpha_t -> h_t feedback path suspected in Run 14).
+        # tau_uses_hidden=False keeps tau adaptive but input-only (still learned,
+        # still varies per step, just not state-dependent).
+        if adaptive_tau:
+            tau_input_dim = input_dim + hidden_dim if tau_uses_hidden else input_dim
+            self.time_constant = nn.Linear(tau_input_dim, hidden_dim)
+        else:
+            if fixed_tau is None:
+                raise ValueError("fixed_tau must be set when adaptive_tau=False")
+            self.time_constant = None
 
         self._recording = False
         self._tau_log: list[torch.Tensor] = []
@@ -69,7 +87,13 @@ class ContinuousTimeCell(nn.Module):
         """
         xh = torch.cat([x_t, h_prev], dim=-1)
         u_t = torch.tanh(self.candidate(xh if self.candidate_uses_hidden else x_t))
-        tau_t = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.time_constant(xh))
+
+        if self.adaptive_tau:
+            tau_input = xh if self.tau_uses_hidden else x_t
+            tau_t = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.time_constant(tau_input))
+        else:
+            tau_t = torch.full_like(u_t, self.fixed_tau)
+
         alpha_t = torch.exp(-dt / tau_t)
 
         if self._recording:

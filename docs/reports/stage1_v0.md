@@ -892,3 +892,82 @@ Command: `uv run python scripts/overfit_single_branch.py --branch mid
 --no-self-recurrence --steps 1000`.
 
 ---
+
+## Run 14 — `--no-self-recurrence` on `mid`: still explodes, hypothesis narrows further
+
+`uv run python scripts/overfit_single_branch.py --branch mid
+--no-self-recurrence --steps 1000` (candidate is now `u_t = phi(W_x x_t)`,
+no `h_{t-1}`; memory/decay mechanics unchanged):
+
+```text
+step  125  total 13.3707  grad_norm  993.479
+step  200  total 24.4088  grad_norm  396.956
+step  225  total  7.4881  grad_norm 3713.068
+step  275  total 10.5259  grad_norm 2231.129
+step  300  total 16.7945  grad_norm 1757.271
+step  325  total  5.4559  grad_norm 2833.970
+...
+step  550  total 26.3984  grad_norm   51.153
+step  625  total  5.1050  grad_norm 1321.069
+step  750  total 23.3093  grad_norm 1722.847
+```
+
+**Removing the candidate's own recurrence barely changed anything** — same
+scale and frequency of explosions as Run 13's `mid` (with self-recurrence).
+This rules out the candidate's `W_hh h_{t-1}` term as *the* mechanism.
+
+### Analysis — sharper hypothesis: state-controlling-its-own-decay-rate feedback
+
+Even with `candidate_uses_hidden=False`, `h_{t-1}` still reaches the update
+through `tau_t = f(x_t, h_{t-1})` -> `alpha_t = exp(-dt/tau_t)` -> `h_t`.
+The cell is not the simple linear-in-`h_{t-1}` system it was intended to
+be; expanding the Jacobian:
+
+```text
+d h_t / d h_{t-1} = alpha_t * I + (h_{t-1} - u_t) * d(alpha_t)/d(h_{t-1})
+```
+
+The second term — the hidden state influencing *its own decay rate*,
+creating a `h_{t-1} -> tau_t -> alpha_t -> (how much of h_{t-1} survives)
+-> h_t -> ...` loop — is now the leading suspect, especially for branches
+where `alpha -> 1` (mid, slow): the state persists almost entirely across
+steps *while simultaneously being allowed to modulate its own persistence*.
+
+### Next step — remove `h_{t-1}` from tau instead (one experiment at a time)
+
+Added to `ContinuousTimeCell`: `adaptive_tau: bool = True` (`False` replaces
+the learned tau network entirely with a constant `fixed_tau`) and
+`tau_uses_hidden: bool = True` (keeps tau learned/adaptive but drops
+`h_{t-1}` from its input: `tau_t = f(x_t)` only). Defaults unchanged, all
+existing tests still pass. `scripts/overfit_single_branch.py` gained
+matching `--fixed-tau <value>` and `--tau-input-only` flags (mutually
+exclusive — one experiment at a time, per plan). Verified without training:
+`ContinuousTimeCell(candidate_uses_hidden=False, adaptive_tau=False,
+fixed_tau=0.275)` runs and produces `alpha = exp(-0.01/0.275) = 0.9643` as
+expected.
+
+**Plan, in order:**
+
+1. `mid`, `candidate_uses_hidden=False`, fully fixed `tau=0.275` (no learned
+   tau network at all — `h_t = 0.9643*h_{t-1} + 0.0357*F(x_t)`, nothing
+   else). If this stabilizes (`grad_norm` 5-30, smooth loss decrease,
+   speech-like output) — the culprit is specifically **state-dependent
+   adaptive tau**, not the leaky integration or long memory itself. If it
+   *still* explodes, the problem is deeper — long leaky integration itself
+   may not work as the main speech transport channel, and the next step
+   would be sweeping fixed tau in {50, 100, 200, 300} ms to find the
+   stability boundary.
+2. Only after (1): keep tau adaptive/learned but input-only
+   (`--tau-input-only`, `tau_t = f(x_t)`, no `h_{t-1}`) — a middle ground
+   that keeps plosive-vs-vowel adaptivity without the state-controls-its-
+   own-persistence feedback loop.
+
+Nothing else changes (same generator, loss, LR, clipping) — the isolation
+matrix so far already narrows the space substantially: plain
+frontend->generator works, `fast` works, `mid`/`slow` adaptive explode,
+`mid` without candidate self-recurrence still explodes the same way.
+
+Command: `uv run python scripts/overfit_single_branch.py --branch mid
+--no-self-recurrence --fixed-tau 0.275 --steps 1000`.
+
+---
