@@ -165,24 +165,11 @@ def absmax(x: torch.Tensor) -> float:
     return x.detach().float().abs().max().item()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Decompose generator_in and ablate decoder-v3's output gain path")
-    parser.add_argument("--ablation", choices=["baseline", "freeze_gate", "fixed_gain", "no_temporal"], default="baseline")
-    parser.add_argument("--fixed-gain-target", type=float, default=1.0, help="target RMS for --ablation fixed_gain")
-    parser.add_argument("--data-root", type=str, default="data/raw")
-    parser.add_argument("--librispeech-url", type=str, default="dev-clean")
-    parser.add_argument("--index", type=int, default=0)
-    parser.add_argument("--seconds", type=float, default=2.0)
-    parser.add_argument("--gate-init", type=float, default=0.1)
-    parser.add_argument("--decoder-gate-init", type=float, default=0.1)
-    parser.add_argument("--steps", type=int, default=1000)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
-    parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--out-dir", type=str, default=None)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+ALL_ABLATIONS = ["baseline", "freeze_gate", "fixed_gain", "no_temporal"]
 
+
+def run_ablation(args: argparse.Namespace, ablation: str) -> dict:
+    """Runs one ablation to completion and returns its final summary stats."""
     device = torch.device(args.device)
     torch.manual_seed(0)
 
@@ -211,9 +198,9 @@ def main() -> None:
 
     z_raw = compute_frozen_z(frontend, cells, projections, encoder_gates, w_x, target)  # [B, dim, T]
 
-    if args.ablation == "no_temporal":
+    if ablation == "no_temporal":
         gate_value, gate_trainable = 0.0, False
-    elif args.ablation == "freeze_gate":
+    elif ablation == "freeze_gate":
         gate_value, gate_trainable = args.decoder_gate_init, False
     else:  # baseline, fixed_gain
         gate_value, gate_trainable = args.decoder_gate_init, True
@@ -224,12 +211,12 @@ def main() -> None:
     params = [p for m in trainable_modules for p in m.parameters()]
     if gate_trainable:
         params.append(gate_decoder)
-    print(f"ablation={args.ablation}  trainable params: {sum(p.numel() for p in params):,}")
+    print(f"\n=== ablation={ablation} ===  trainable params: {sum(p.numel() for p in params):,}")
 
     criterion = ReconstructionLoss().to(device)
     optimizer = torch.optim.AdamW(params, lr=args.lr)
 
-    out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/decoder_output_gain_{args.ablation}")
+    out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/decoder_output_gain_{ablation}")
     out_dir.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(out_dir / "target.wav"), target[0].detach().cpu(), SAMPLE_RATE)
 
@@ -248,7 +235,7 @@ def main() -> None:
         temporal_raw, branch_states = decoder_forward_with_stats(decoder, z_bt, device)  # [B, T, dim]
         skip = w_skip_decoder(z_raw).transpose(1, 2)  # [B, T, dim] -- recomputed since w_skip_decoder is trainable
 
-        if args.ablation == "fixed_gain":
+        if ablation == "fixed_gain":
             raw_rms = temporal_raw.detach().pow(2).mean().sqrt().clamp_min(1e-8)
             temporal_for_gate = temporal_raw * (args.fixed_gain_target / raw_rms)
         else:
@@ -310,7 +297,7 @@ def main() -> None:
                 "waveform_saturation_fraction": (recon.detach().abs() > 0.95).float().mean().item(),
             }
             log_records.append(record)
-            log_path.write_text(json.dumps({"ablation": args.ablation, "steps": args.steps, "log": log_records}, indent=2))
+            log_path.write_text(json.dumps({"ablation": ablation, "steps": args.steps, "log": log_records}, indent=2))
 
             print(
                 f"step {step:>5d}  total {loss.item():.4f}  grad_norm {grad_norm.item():>9.3f}  best {best_loss:.4f}  "
@@ -321,8 +308,50 @@ def main() -> None:
             )
 
     torchaudio.save(str(out_dir / "recon_final.wav"), recon[0].detach().cpu(), SAMPLE_RATE)
-    print(f"\nsamples written to: {out_dir}")
+    print(f"samples written to: {out_dir}")
     print(f"JSON log written to: {log_path}")
+
+    max_grad_norm = max(r["grad_norm"] for r in log_records)
+    return {
+        "ablation": ablation,
+        "best_loss": best_loss,
+        "final_loss": log_records[-1]["total_loss"],
+        "max_grad_norm": max_grad_norm,
+        "final_generator_in_rms": log_records[-1]["generator_in_rms"],
+        "final_waveform_saturation_fraction": log_records[-1]["waveform_saturation_fraction"],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Decompose generator_in and ablate decoder-v3's output gain path")
+    parser.add_argument("--ablation", choices=[*ALL_ABLATIONS, "all"], default="all")
+    parser.add_argument("--fixed-gain-target", type=float, default=1.0, help="target RMS for --ablation fixed_gain")
+    parser.add_argument("--data-root", type=str, default="data/raw")
+    parser.add_argument("--librispeech-url", type=str, default="dev-clean")
+    parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--seconds", type=float, default=2.0)
+    parser.add_argument("--gate-init", type=float, default=0.1)
+    parser.add_argument("--decoder-gate-init", type=float, default=0.1)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    ablations = ALL_ABLATIONS if args.ablation == "all" else [args.ablation]
+    summaries = [run_ablation(args, ablation) for ablation in ablations]
+
+    if len(summaries) > 1:
+        print("\n=== summary (all ablations) ===")
+        header = f"{'ablation':>12}  {'best_loss':>10}  {'final_loss':>10}  {'max_grad_norm':>13}  {'final_gen_in_rms':>16}  {'final_sat_frac':>14}"
+        print(header)
+        for s in summaries:
+            print(
+                f"{s['ablation']:>12}  {s['best_loss']:>10.4f}  {s['final_loss']:>10.4f}  "
+                f"{s['max_grad_norm']:>13.3f}  {s['final_generator_in_rms']:>16.4f}  {s['final_waveform_saturation_fraction']:>14.4f}"
+            )
 
 
 if __name__ == "__main__":
