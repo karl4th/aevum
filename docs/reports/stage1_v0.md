@@ -1776,6 +1776,113 @@ uv run python scripts/diagnose_decoder_output_gain.py --ablation fixed_gain --st
 uv run python scripts/diagnose_decoder_output_gain.py --ablation no_temporal --steps 1000
 ```
 
+(Refactored afterward so `uv run python scripts/diagnose_decoder_output_gain.py --steps 1000` alone runs all four in sequence with a final summary table — `--ablation` defaults to `all`.)
+
+---
+
+## Run 26 — All four ablations, full 1000 steps: gate-collapse, not amplitude runaway
+
+Full run (`uv run python scripts/diagnose_decoder_output_gain.py --steps 1000`,
+all four ablations in one command). Headline numbers (best loss is the
+true per-step minimum tracked internally and printed in the console summary
+table — not the same as taking a minimum over only the every-10-steps
+JSON log records, which is a looser upper bound; use these, not any
+earlier JSON-derived approximation):
+
+```text
+ablation       best_loss   final g_decoder   max grad_norm (any step)
+baseline       1.63        0.040 (drifted down from 0.101, plateaus ~step 800+)
+freeze_gate    0.9199      0.100 (fixed)     125.98 @ step 110
+fixed_gain     1.6321      0.042 (drifted down from 0.101, plateaus ~step 300+)
+no_temporal    1.2332      0.000 (fixed)     43.85
+```
+
+None of the four showed the catastrophic explosions seen in every prior
+full-pipeline run (grad_norm in the thousands) — max across all four here
+is 126. Verified over full trajectories, not just the printed snapshots:
+`max(generator_pretanh_absmax)` across the whole 1000 steps is 0.75
+(baseline), 0.68 (freeze_gate), 0.75 (fixed_gain) — nowhere near the tanh
+saturation boundary; `waveform_saturation_fraction` is exactly 0.0 for all
+three (no_temporal: ~0.00006, negligible). `g_decoder` in both
+`baseline` and `fixed_gain` has already plateaued by step ~700-900 (not
+still crashing toward 0) — the system reaches a stable, but poor,
+equilibrium within the 1000-step budget, not an unbounded collapse in
+progress.
+
+**Ranking by loss: `freeze_gate` (0.92) < `no_temporal` (1.23) <
+`baseline` (1.63) ~ `fixed_gain` (1.63).** The two configurations where the
+gate is *free to be trained* end up worse than both a fully-forced gate
+(0.1) and a fully-zeroed gate (0.0) — the free optimizer finds a partial,
+intermediate suppression (~0.04) that is worse than either extreme.
+
+### Analysis
+
+**The generator-saturation/amplitude-runaway hypothesis from Run 25 is now
+fully retired.** Pre-tanh values stay well inside the linear region of
+`tanh` throughout, in every configuration, at every logged step — there is
+no "generator gets pushed into clipping" mechanism operating here.
+
+**`fixed_gain` is the decisive negative control.** It specifically removes
+the "grow raw output amplitude" escape route (`temporal_raw` is rescaled to
+a fixed target RMS via a *detached* statistic before gating, so `to_output`
+still gets normal gradients, just can't inflate the branch's overall scale)
+— and `g_decoder` still converges to essentially the same suppressed value
+(~0.042) as unconstrained `baseline` (~0.040), with no loss improvement.
+This isolates the mechanism specifically to **the scalar gate itself**, not
+to unconstrained downstream gain: the optimizer's cheap escape is
+*shrinking the gate*, not *inflating amplitude which then gets clipped*.
+
+**Mechanism (user's formulation):** `y = skip(z) + g*T(z)`. The skip path
+gives useful gradient quickly and cheaply; `T` (the temporal/decoder
+branch) is a harder optimization target. Since `dL/dT ∝ g`, any early dip
+in `g` directly starves `T`'s own gradient signal, making `T` even less
+likely to improve, which makes shrinking `g` further look even more
+attractive — a self-reinforcing partial collapse of the temporal branch's
+contribution, not a runaway in either direction, just settling at a bad
+partial-suppression equilibrium.
+
+**Critical new evidence — listening, not loss, is decisive here (user):**
+of the four reconstructions, **only `freeze_gate` (g=0.1, forced) sounds
+natural; `baseline`, `fixed_gain`, and `no_temporal` all sound
+robotic/robotic-ish**, despite `no_temporal` having the second-best loss
+(1.23). This reframes the finding: the temporal branch isn't just
+loss-helpful, it appears to specifically carry the temporal/prosodic
+structure (micro-dynamics, smoothness of transitions, natural phase/timing
+structure) that the reconstruction loss under-weights relative to how
+audibly important it is. `skip` alone can satisfy the magnitude-based
+mel/STFT/wav loss reasonably well (best-4th-of-4 loss, still "OK" by the
+numbers) while still sounding robotic — **the loss is not sufficiently
+sensitive to naturalness**, and the free-gate configurations demonstrate
+the optimizer exploiting exactly that blind spot (suppress the harder,
+loss-inefficient-per-step branch that happens to carry naturalness, keep
+the cheap branch that satisfies the numeric objective).
+
+**Explicit lesson flagged for later AEVUM stages:** if the eventual
+event-driven system is only evaluated by mel/STFT reconstruction loss, the
+optimizer may find the same kind of "technically reconstructs, kills live
+temporal dynamics" shortcut again. Perceptual/naturalness evaluation (not
+just aggregate spectral loss) needs to stay in the loop, not just at Stage
+1 but as a standing methodological caution for later stages too.
+
+### Next step
+
+Per the user's plan:
+
+1. **Freeze `freeze_gate` (g=0.1) as the current best working decoder
+   configuration.** Don't modify it further for now — it is both the best
+   by loss and the only one that sounds natural.
+2. **Sweep fixed gate values** `g in {0.05, 0.10, 0.15, 0.20}` (0.00 is
+   already covered by `no_temporal`'s result; 0.10 by the existing
+   `freeze_gate` run), 1000 steps each, and **listen to each**, not just
+   compare loss — building a table of `(g, best_loss, naturalness,
+   robotic-ness, stability)`. The working hypothesis is that the
+   perceptual/naturalness optimum may not coincide with the loss optimum.
+
+`--ablation freeze_gate --decoder-gate-init <g>` already implements each
+sweep point with the existing script (no new code needed for a single
+value); a convenience mode to run the whole sweep in one command may be
+added next if useful.
+
 ---
 
 ## Cross-project note
