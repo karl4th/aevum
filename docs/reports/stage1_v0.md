@@ -2033,6 +2033,29 @@ further, the two remaining spikes are likely just normal early-training
 noise, and the current state (best loss 0.5693, clean for 85% of the run)
 would be considered good enough to move forward.
 
+**Result: fixed tau is a regression, not a fix — reverted.**
+`--no-decoder-self-recurrence --decoder-fixed-tau`, same g=0.05, 2000 steps:
+
+```text
+best loss:        0.7574  (vs 0.5693 without fixed tau -- worse)
+max grad_norm:    1607.20 @ step 170  (vs 307.85 -- worse)
+spikes > 50:      16, clustered steps 170-430  (vs 2 -- much worse)
+max fast_h_absmax: 1.0000  (saturation is BACK -- Run 28 had 0.5127)
+max mid_h_absmax:  0.9992  (Run 28 had 0.3667)
+```
+
+Fixing tau removes the decoder's ability to modulate its own integration
+speed in response to the signal; with that flexibility gone, the candidate
+pathway alone apparently pushes hidden states right back into saturation —
+undoing exactly what removing self-recurrence had fixed. **Fixed tau is
+discarded; adaptive tau is kept.** Current best configuration remains Run
+28's: `no_decoder_self_recurrence=True`, tau adaptive (default).
+
+Per the user's decision to check this through fully regardless: next,
+test disabling decoder cross-connections *on top of Run 28's config*
+(self-recurrence off, adaptive tau) — not on top of the now-discarded
+fixed-tau config.
+
 **Listening result (user), decisive:** the reconstruction from this run
 "на слух очень хорошая... роботизированность тоже исчезла" — sounds very
 good, and the robotic quality that persisted through *every* prior decoder
