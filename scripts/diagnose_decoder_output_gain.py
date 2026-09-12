@@ -50,11 +50,19 @@ always with the same full logging:
 
 See docs/reports/stage1_v0.md, Run 26.
 
+Run 26 (--ablation all, or equivalently the four separate commands) found
+that only `freeze_gate` (gate fixed at 0.1) sounds natural on listening;
+`baseline`, `fixed_gain`, and `no_temporal` all sound robotic despite
+`no_temporal` having the second-best loss -- suggesting the perceptual
+optimum for the gate value may not coincide with the loss optimum. Run 27's
+`--gate-values` sweep tests several fixed gate values in one command (same
+mechanics as `freeze_gate`, parameterized) to map out `loss` vs `g` and let
+the user listen to each.
+
 Usage (each capped at 1000 steps per the user's instruction):
-    uv run scripts/diagnose_decoder_output_gain.py --ablation baseline --steps 1000
+    uv run scripts/diagnose_decoder_output_gain.py --steps 1000
     uv run scripts/diagnose_decoder_output_gain.py --ablation freeze_gate --steps 1000
-    uv run scripts/diagnose_decoder_output_gain.py --ablation fixed_gain --steps 1000
-    uv run scripts/diagnose_decoder_output_gain.py --ablation no_temporal --steps 1000
+    uv run scripts/diagnose_decoder_output_gain.py --gate-values 0.05 0.10 0.15 0.20 --steps 1000
 """
 
 import argparse
@@ -168,8 +176,14 @@ def absmax(x: torch.Tensor) -> float:
 ALL_ABLATIONS = ["baseline", "freeze_gate", "fixed_gain", "no_temporal"]
 
 
-def run_ablation(args: argparse.Namespace, ablation: str) -> dict:
-    """Runs one ablation to completion and returns its final summary stats."""
+def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float | None = None) -> dict:
+    """Runs one ablation to completion and returns its final summary stats.
+
+    ``gate_override`` (used by the ``--gate-values`` sweep) fixes the gate at
+    this exact value, excluded from the optimizer -- the same mechanics as
+    ``freeze_gate``, just parameterized, and labeled distinctly in output
+    paths/logs so a sweep's runs don't collide with the four named ablations.
+    """
     device = torch.device(args.device)
     torch.manual_seed(0)
 
@@ -198,12 +212,14 @@ def run_ablation(args: argparse.Namespace, ablation: str) -> dict:
 
     z_raw = compute_frozen_z(frontend, cells, projections, encoder_gates, w_x, target)  # [B, dim, T]
 
-    if ablation == "no_temporal":
-        gate_value, gate_trainable = 0.0, False
+    if gate_override is not None:
+        gate_value, gate_trainable, label = gate_override, False, f"gate_{gate_override:.2f}"
+    elif ablation == "no_temporal":
+        gate_value, gate_trainable, label = 0.0, False, ablation
     elif ablation == "freeze_gate":
-        gate_value, gate_trainable = args.decoder_gate_init, False
+        gate_value, gate_trainable, label = args.decoder_gate_init, False, ablation
     else:  # baseline, fixed_gain
-        gate_value, gate_trainable = args.decoder_gate_init, True
+        gate_value, gate_trainable, label = args.decoder_gate_init, True, ablation
 
     gate_decoder = nn.Parameter(torch.tensor(gate_value, device=device)) if gate_trainable else torch.tensor(gate_value, device=device)
 
@@ -211,12 +227,12 @@ def run_ablation(args: argparse.Namespace, ablation: str) -> dict:
     params = [p for m in trainable_modules for p in m.parameters()]
     if gate_trainable:
         params.append(gate_decoder)
-    print(f"\n=== ablation={ablation} ===  trainable params: {sum(p.numel() for p in params):,}")
+    print(f"\n=== {label} ===  trainable params: {sum(p.numel() for p in params):,}")
 
     criterion = ReconstructionLoss().to(device)
     optimizer = torch.optim.AdamW(params, lr=args.lr)
 
-    out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/decoder_output_gain_{ablation}")
+    out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/decoder_output_gain_{label}")
     out_dir.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(out_dir / "target.wav"), target[0].detach().cpu(), SAMPLE_RATE)
 
@@ -297,7 +313,7 @@ def run_ablation(args: argparse.Namespace, ablation: str) -> dict:
                 "waveform_saturation_fraction": (recon.detach().abs() > 0.95).float().mean().item(),
             }
             log_records.append(record)
-            log_path.write_text(json.dumps({"ablation": ablation, "steps": args.steps, "log": log_records}, indent=2))
+            log_path.write_text(json.dumps({"ablation": label, "steps": args.steps, "log": log_records}, indent=2))
 
             print(
                 f"step {step:>5d}  total {loss.item():.4f}  grad_norm {grad_norm.item():>9.3f}  best {best_loss:.4f}  "
@@ -313,7 +329,7 @@ def run_ablation(args: argparse.Namespace, ablation: str) -> dict:
 
     max_grad_norm = max(r["grad_norm"] for r in log_records)
     return {
-        "ablation": ablation,
+        "ablation": label,
         "best_loss": best_loss,
         "final_loss": log_records[-1]["total_loss"],
         "max_grad_norm": max_grad_norm,
@@ -325,6 +341,15 @@ def run_ablation(args: argparse.Namespace, ablation: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Decompose generator_in and ablate decoder-v3's output gain path")
     parser.add_argument("--ablation", choices=[*ALL_ABLATIONS, "all"], default="all")
+    parser.add_argument(
+        "--gate-values",
+        type=float,
+        nargs="+",
+        default=None,
+        help="run a fixed-gate sweep instead of --ablation: one run per value, "
+        "each with the gate fixed at that value (freeze_gate mechanics) and excluded from the optimizer. "
+        "e.g. --gate-values 0.05 0.10 0.15 0.20",
+    )
     parser.add_argument("--fixed-gain-target", type=float, default=1.0, help="target RMS for --ablation fixed_gain")
     parser.add_argument("--data-root", type=str, default="data/raw")
     parser.add_argument("--librispeech-url", type=str, default="dev-clean")
@@ -340,11 +365,14 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    ablations = ALL_ABLATIONS if args.ablation == "all" else [args.ablation]
-    summaries = [run_ablation(args, ablation) for ablation in ablations]
+    if args.gate_values:
+        summaries = [run_ablation(args, "gate_sweep", gate_override=g) for g in args.gate_values]
+    else:
+        ablations = ALL_ABLATIONS if args.ablation == "all" else [args.ablation]
+        summaries = [run_ablation(args, ablation) for ablation in ablations]
 
     if len(summaries) > 1:
-        print("\n=== summary (all ablations) ===")
+        print("\n=== summary ===")
         header = f"{'ablation':>12}  {'best_loss':>10}  {'final_loss':>10}  {'max_grad_norm':>13}  {'final_gen_in_rms':>16}  {'final_sat_frac':>14}"
         print(header)
         for s in summaries:
