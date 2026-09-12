@@ -2099,6 +2099,78 @@ confirm the fix holds end-to-end (not just decoder-in-isolation with a
 frozen encoder) before considering Stage 1 architecture work complete and
 moving toward LibriSpeech training / package integration.
 
+---
+
+## Run 31 — Full pipeline with both fixes: clean, stable, best result of the entire investigation
+
+`uv run python scripts/overfit_full_pipeline_v4.py --steps 2000`: real
+(not frozen) encoder — fast+mid+slow+direct residual, gated fusion
+(Run 19) — feeding the fixed decoder (`candidate_uses_hidden=False`,
+Run 28) with its output gate fixed at `g=0.05` (not trained, per Run 26),
+into the generator. This is the first time the *complete*, *jointly
+trained* pipeline has run with both the encoder-side (Run 16-19) and
+decoder-side (Run 28) fixes in place simultaneously.
+
+```text
+step    0  total 5.4640  grad_norm  12.18
+step  100  total 3.7937  grad_norm  20.27
+step  400  total 2.2859  grad_norm   7.98
+step  700  total 0.8742  grad_norm   7.45
+step 1000  total 0.5765  grad_norm   6.60
+step 1400  total 0.4802  grad_norm   6.41
+step 1999  total 0.3515  grad_norm   8.34
+best loss: 0.3321
+max grad_norm across all 2000 steps: 101.09 (step 75) -- one moderate
+  spike, nothing else above 56 the entire run
+```
+
+Encoder gates behave healthily throughout, matching Run 19/22's finding
+(not the decoder's gate-collapse pattern): `g_fast` 0.101 -> 0.128,
+`g_mid` 0.099 -> 0.154, `g_slow` stays ~0.09 -- all growing or stable, none
+suppressed toward zero.
+
+### Analysis
+
+**This is the cleanest, best-performing full-pipeline run of the entire
+investigation (Runs 4/5/8/20/21 all exploded or plateaued on noise at this
+point).** Best loss (0.3321) is dramatically better than any previous
+full-pipeline attempt (which never got below ~3 before diverging), and the
+single worst gradient spike (101) is two to three orders of magnitude
+smaller than every prior full-pipeline explosion (3573-19545 range in
+Runs 20/21/24). No catastrophic divergence at any point across the full
+2000 steps.
+
+This confirms, end-to-end and under real joint training (not a
+frozen-encoder decoder-only testbed), that the two fixes identified in this
+investigation — encoder direct-residual + gated fusion (Runs 16-19) and
+decoder self-recurrence removal (Run 28) — combine cleanly and resolve the
+original Run 4/5/8 problem this entire report has been chasing: **loss
+goes down and the reconstruction is not noise.**
+
+### Status: Stage 1 core architecture validated
+
+The single-clip overfit testbed has done its job — it isolated a real,
+diagnosable, fixable problem (not a fundamental flaw in the AEVUM
+continuous-time concept) and pinned it down to two specific, narrow
+mechanisms. Recommended next steps (not yet done, pending user decision):
+
+1. Port the validated design into `aevum.models` proper:
+   `ContinuousEncoder`/`autoencoder.py` currently still reflect the
+   pre-Run-16 design (cross-connections, no direct residual, no gated
+   fusion) — needs updating to match what Runs 16-19/31 actually validated.
+   `ContinuousDecoder` already has the `candidate_uses_hidden` flag (Run 27)
+   but `train_stage1.py`/`DenseContinuousAutoencoder` don't use it yet.
+2. Re-run `train_stage1.py` on real LibriSpeech `dev-clean` data (not a
+   single repeated clip) with the updated architecture, since everything
+   in Runs 9-31 was single-clip overfitting — generalization across
+   diverse real utterances is still unverified.
+3. Listening confirmation on `outputs/full_pipeline_v4/recon_best.wav`
+   against `target.wav` is still needed (not yet done by the user at time
+   of writing) to confirm naturalness holds in the fully joint-trained
+   setting, not just the frozen-encoder decoder-only test from Run 28.
+
+---
+
 **Listening result (user), decisive:** the reconstruction from this run
 "на слух очень хорошая... роботизированность тоже исчезла" — sounds very
 good, and the robotic quality that persisted through *every* prior decoder
