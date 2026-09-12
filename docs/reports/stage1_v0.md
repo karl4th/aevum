@@ -1554,6 +1554,106 @@ uv run python scripts/overfit_frozen_encoder_decoder.py --steps 2000
 
 ---
 
+## Run 24 — Frozen encoder + decoder-v3: intermittent explosions, not monotonic divergence
+
+`uv run python scripts/overfit_frozen_encoder_decoder.py --steps 2000` (real
+result differs from Run 21's outright divergence — worth its own entry):
+
+```text
+step    0  total  5.7578  grad_norm    23.676  g_decoder=0.0990
+step   75  total  4.7768  grad_norm     3.848  best 4.7768  g_decoder=0.0835
+step  175  total  8.3566  grad_norm  1277.567  g_decoder=0.0658  (spike)
+step  225  total 12.5374  grad_norm  2022.817  g_decoder=0.0643  (spike)
+step  300  total 11.4631  grad_norm  3453.390  best 3.2258  g_decoder=0.0596  (spike)
+step  400  total  5.5067  grad_norm   748.270  g_decoder=0.0557  (spike)
+step  450  total  3.5524  grad_norm     9.658  g_decoder=0.0560  (recovered)
+step  600  total  2.9262  grad_norm     9.934  best 2.9062  g_decoder=0.0793
+step  675  total  2.7132  grad_norm     8.208  best 2.6828  g_decoder=0.1184
+step  725  total  2.6822  grad_norm    11.373  best 2.6598  g_decoder=0.1544  (rising, recovering further)
+```
+
+**User's read:** this is intermittently unstable dynamics, not a clean
+monotonic explosion — the run recovers repeatedly and, after step ~450,
+settles into calm gradients (single-to-low-double digits) with steadily
+improving loss and a `g_decoder` that stops falling and starts climbing
+again (0.056 -> 0.154 by step 725), suggesting the decoder's own dynamics
+are being used more, not less, once past the unstable region. With a fully
+fixed `z` (not jointly shifting), a distribution-coupling explanation alone
+doesn't fit this pattern well — motivating a direct interface diagnostic
+rather than further black-box trial and error.
+
+---
+
+## Run 25 (setup) — Encoder-decoder interface diagnostic
+
+Per the user's plan: (A) measure `frozen_encoder_z`'s statistics directly,
+(B) compare against the free-latent Z decoder is known to eventually train
+well on, (D/E) test cheap normalization interventions on z before the
+decoder without touching decoder or encoder architecture, (F) log
+per-branch decoder hidden-state RMS/abs-max every few steps to catch which
+tensor moves first before a spike, instead of only seeing the aggregate
+`grad_norm` after the fact.
+
+Added `src/aevum/utils/latent_stats.py` (shape/scale/temporal-smoothness
+stats: rms, abs_max, per-channel std range, temporal delta rms, temporal
+cosine similarity, per-timestep norm range) and
+`scripts/diagnose_decoder_interface.py`, which prints these stats for the
+frozen encoder's raw `z`, optionally applies `--normalize {none, rmsnorm,
+channelnorm, rmsnorm_linear}` before feeding `z` to decoder-v3, and logs
+`decoder_input_rms` / per-branch (`fast`/`mid`/`slow`) hidden RMS and
+abs-max / `generator_input_rms` every `--stats-every` steps via a manual
+replication of `ContinuousDecoder.forward` (`decoder_forward_with_stats`)
+that exposes the per-timestep branch states `ContinuousDecoder.forward`
+doesn't return on its own. Also added periodic `latent_stats` printing (at
+steps 0/100/500/1000/2000) to `overfit_decoder_v3_free_latent.py`, for a
+direct side-by-side comparison against the frozen encoder's z.
+
+**Smoke test finding (2 steps, but the printed stats are informative
+immediately, before any training):**
+
+```text
+frozen_encoder_z (raw), shape (1, 200, 384):
+  rms: 0.0119        abs_max: 0.0325
+  channel std: min 0.000135 / median 0.000458 / max 0.00139
+  delta rms: 0.000259   delta abs_max: 0.00676
+  temporal cosine mean: 0.9998   <- adjacent 10ms frames are nearly identical in direction
+  norm/t: mean 0.234, std 0.0010 (essentially constant across the whole clip)
+```
+
+**Important caveat before over-interpreting this:** in this test the
+*entire* encoder (frontend included) is at random initialization and never
+trained (by design, to isolate decoder capacity vs. gradient coupling —
+Run 22's plan). This tiny-scale, near-constant, extremely temporally-smooth
+`z` could be an artifact of an untrained random frontend+cells+projections
+compounding shrinkage through several layers, rather than a property of
+what a *trained* encoder (as in Run 19/22, which reached loss 0.2295)
+actually hands the decoder. The free-latent Z comparison (already
+instrumented, not yet run) and, eventually, comparing against Run 19/22's
+*trained* encoder's z, are needed before concluding real encoder output is
+"too smooth" in general — right now this is only demonstrated for a random,
+untrained one.
+
+Normalization variants change the statistics as expected: `rmsnorm` raises
+rms to ~1.0 (abs_max 2.71, temporal cosine unchanged at 0.9998 since RMSNorm
+doesn't touch direction); `channelnorm` produces the largest spread
+(abs_max 12.51) and is the only one that meaningfully disrupts temporal
+smoothness (cosine drops to 0.806); `rmsnorm_linear` lands in between
+(abs_max 2.03).
+
+All four `--normalize` variants and the free-latent comparison verified
+with 2-step smoke runs — no errors, sane loss/grad_norm.
+
+**Commands (each independent, run to full length for real signal):**
+```
+uv run python scripts/diagnose_decoder_interface.py --normalize none --steps 2000
+uv run python scripts/diagnose_decoder_interface.py --normalize rmsnorm --steps 2000
+uv run python scripts/diagnose_decoder_interface.py --normalize channelnorm --steps 2000
+uv run python scripts/diagnose_decoder_interface.py --normalize rmsnorm_linear --steps 2000
+uv run python scripts/overfit_decoder_v3_free_latent.py --steps 2000
+```
+
+---
+
 ## Cross-project note
 
 The general lesson from Runs 11-18 (a slow-decaying continuous-time state

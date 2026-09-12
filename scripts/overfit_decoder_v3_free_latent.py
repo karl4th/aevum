@@ -40,6 +40,7 @@ from aevum.data.librispeech import LibriSpeechSegments
 from aevum.models.decoder import ContinuousDecoder
 from aevum.models.generator import CausalWaveformGenerator
 from aevum.training.losses.reconstruction import ReconstructionLoss
+from aevum.utils.latent_stats import latent_stats
 
 SAMPLE_RATE = 24_000
 
@@ -71,6 +72,13 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument(
+        "--stats-steps",
+        type=int,
+        nargs="+",
+        default=[0, 100, 500, 1000, 2000],
+        help="training steps at which to print latent_stats(Z) -- used to compare against the frozen encoder's z (Run 25)",
+    )
     parser.add_argument("--out-dir", type=str, default="outputs/decoder_v3_free_latent")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -102,7 +110,11 @@ def main() -> None:
 
     best_loss = float("inf")
     recon = None
+    stats_steps = set(args.stats_steps)
     for step in range(args.steps):
+        if step in stats_steps:
+            latent_stats(f"free_Z_step{step}", z)
+
         y, _ = decoder(z)  # [B, T, latent_dim]
         y_for_generator = y.transpose(1, 2) + gate_decoder * w_skip_decoder(z.transpose(1, 2))
         recon = generator(y_for_generator)
@@ -124,6 +136,9 @@ def main() -> None:
                 f"mel {loss_dict['mel'].item():.4f}  stft {loss_dict['stft'].item():.4f}  "
                 f"grad_norm {grad_norm.item():.3f}  best {best_loss:.4f}  g_decoder={gate_decoder.item():.4f}"
             )
+
+    if args.steps in stats_steps:
+        latent_stats(f"free_Z_step{args.steps}", z)
 
     torchaudio.save(str(out_dir / "recon_final.wav"), recon[0].detach().cpu(), SAMPLE_RATE)
     print(f"\nsamples written to: {out_dir}")
