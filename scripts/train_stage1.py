@@ -2,13 +2,23 @@
 """Stage 1 training: dense continuous autoencoder, no quantization/predictor/event gate.
 
 Validates the architectural hypothesis in isolation (tech_spec.md section 41,
-Stage 1) before any codec-specific machinery is added on top.
+Stage 1) before any codec-specific machinery is added on top. Uses the
+architecture validated end-to-end in docs/reports/stage1_v0.md (Runs 16-31):
+encoder direct-residual + gated fusion, decoder self-recurrence removed +
+fixed-gate skip.
+
+Every logged step (train and validation) is appended to a JSON log file
+(default outputs/train_log.json) as well as printed, so a run's full
+history can be inspected/plotted afterward rather than only skimmed from
+console output.
 
 Usage:
     uv run scripts/train_stage1.py --data-root data/raw --librispeech-url dev-clean --steps 5000
 """
 
 import argparse
+import json
+import time
 from pathlib import Path
 
 import torch
@@ -33,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-every", type=int, default=500)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
     parser.add_argument("--checkpoint-dir", type=str, default="outputs")
+    parser.add_argument("--log-file", type=str, default=None, help="JSON log path, default <checkpoint-dir>/train_log.json")
+    parser.add_argument("--resume", type=str, default=None, help="path to a checkpoint (.pt) to resume model weights from")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -52,6 +64,9 @@ def main() -> None:
     val_waveform = dataset[0].unsqueeze(0).to(device)
 
     model = DenseContinuousAutoencoder().to(device)
+    if args.resume:
+        model.load_state_dict(torch.load(args.resume, map_location=device))
+        print(f"resumed model weights from {args.resume}")
     criterion = ReconstructionLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -61,8 +76,21 @@ def main() -> None:
     samples_dir.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(samples_dir / "val_target.wav"), val_waveform[0].cpu(), 24_000)
 
+    log_path = Path(args.log_file) if args.log_file else checkpoint_dir / "train_log.json"
+    run_config = vars(args) | {
+        "model_params": sum(p.numel() for p in model.parameters()),
+        "device": str(device),
+    }
+    train_log: list[dict] = []
+    val_log: list[dict] = []
+
+    def write_log() -> None:
+        log_path.write_text(json.dumps({"config": run_config, "train": train_log, "val": val_log}, indent=2))
+
     best_val_loss = float("inf")
     step = 0
+    start_time = time.perf_counter()
+    audio_seconds_seen = 0.0
     while step < args.steps:
         for waveform in loader:
             waveform = waveform.to(device)
@@ -72,14 +100,39 @@ def main() -> None:
 
             optimizer.zero_grad()
             losses["total"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
             optimizer.step()
 
+            audio_seconds_seen += waveform.shape[0] * args.segment_seconds
+
             if step % args.log_every == 0:
+                elapsed = time.perf_counter() - start_time
+                gates = {
+                    "fast": model.encoder.fast_gate.item(),
+                    "mid": model.encoder.mid_gate.item(),
+                    "slow": model.encoder.slow_gate.item(),
+                }
+                record = {
+                    "step": step,
+                    "elapsed_sec": elapsed,
+                    "audio_seconds_seen": audio_seconds_seen,
+                    "total_loss": losses["total"].item(),
+                    "wav_loss": losses["wav"].item(),
+                    "mel_loss": losses["mel"].item(),
+                    "stft_loss": losses["stft"].item(),
+                    "grad_norm": grad_norm.item(),
+                    "gate_fast": gates["fast"],
+                    "gate_mid": gates["mid"],
+                    "gate_slow": gates["slow"],
+                }
+                train_log.append(record)
+                write_log()
                 print(
                     f"step {step:>7d}  total {losses['total'].item():.4f}  "
                     f"wav {losses['wav'].item():.4f}  mel {losses['mel'].item():.4f}  "
-                    f"stft {losses['stft'].item():.4f}"
+                    f"stft {losses['stft'].item():.4f}  grad_norm {grad_norm.item():.3f}  "
+                    f"gates(f/m/s) {gates['fast']:.3f}/{gates['mid']:.3f}/{gates['slow']:.3f}  "
+                    f"elapsed {elapsed:.0f}s"
                 )
 
             if step % args.sample_every == 0:
@@ -90,6 +143,8 @@ def main() -> None:
                 model.train()
 
                 torchaudio.save(str(samples_dir / f"val_step{step}.wav"), val_recon[0].cpu(), 24_000)
+                val_log.append({"step": step, "val_loss": val_loss, "best_val_loss": min(best_val_loss, val_loss)})
+                write_log()
                 print(f"  [val] step {step:>7d}  loss {val_loss:.4f}  (best {best_val_loss:.4f})")
 
                 if val_loss < best_val_loss:
@@ -105,6 +160,8 @@ def main() -> None:
                 break
 
     torch.save(model.state_dict(), checkpoint_dir / "stage1_final.pt")
+    write_log()
+    print(f"\ntrain log written to: {log_path}")
 
 
 if __name__ == "__main__":

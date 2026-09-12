@@ -5,6 +5,21 @@ every step is treated as if it were an event, so there is no quantization,
 predictor, or event gate yet — this module only validates that the causal
 frontend + continuous-time dynamics can carry enough information to
 reconstruct speech.
+
+Architecture as validated end-to-end in docs/reports/stage1_v0.md (Runs
+16-19, 22, 31), not tech_spec.md's original design: the fused multi-
+timescale state is not the sole path from frontend features to the latent.
+A slow-decaying continuous state cannot safely be the sole transport
+channel for full-bandwidth signal (see ../../../lessons-continuous-time-
+dynamics.md for the general lesson) — forcing that produced gradient
+explosions and, decisively, robotic-sounding audio (Run 11-19). Instead,
+frontend features reach the latent directly (identity-initialized when
+dimensions allow), and each timescale branch contributes on top through a
+small-init learnable gate, so training starts close to the already-proven
+frontend-only baseline and the branches have to earn their contribution.
+Branches also have no cross-timescale connections and no self-recurrence
+in their own candidate (Run 14/19/22): memory already exists via
+alpha_t*h_{t-1}, a second recurrent path was never shown to help.
 """
 
 from __future__ import annotations
@@ -23,17 +38,41 @@ class ContinuousEncoder(nn.Module):
         fast_dim: int = 192,
         mid_dim: int = 192,
         slow_dim: int = 192,
-        latent_dim: int = 512,
+        latent_dim: int | None = None,
         step_seconds: float = 0.01,
+        gate_init: float = 0.1,
     ) -> None:
         super().__init__()
         self.step_seconds = step_seconds
         self.frontend = CausalAcousticFrontend()
-        self.dynamics = MultiTimescaleDynamics(self.frontend.output_dim, fast_dim, mid_dim, slow_dim)
+        input_dim = self.frontend.output_dim
+        latent_dim = input_dim if latent_dim is None else latent_dim
 
-        fused_dim = fast_dim + mid_dim + slow_dim
-        self.norm = nn.RMSNorm(fused_dim)
-        self.to_latent = nn.Linear(fused_dim, latent_dim)
+        self.dynamics = MultiTimescaleDynamics(
+            input_dim,
+            fast_dim,
+            mid_dim,
+            slow_dim,
+            candidate_uses_hidden=False,
+            disable_cross_connections=True,
+        )
+
+        # Direct instantaneous path: identity-initialized when dims match, so
+        # z_t starts out equal to the already-proven frontend-only baseline
+        # (docs/reports/stage1_v0.md Run 12) before the gated branches below
+        # learn to contribute anything.
+        self.w_x = nn.Linear(input_dim, latent_dim)
+        if latent_dim == input_dim:
+            with torch.no_grad():
+                self.w_x.weight.copy_(torch.eye(latent_dim))
+                self.w_x.bias.zero_()
+
+        self.fast_proj = nn.Linear(fast_dim, latent_dim)
+        self.mid_proj = nn.Linear(mid_dim, latent_dim)
+        self.slow_proj = nn.Linear(slow_dim, latent_dim)
+        self.fast_gate = nn.Parameter(torch.tensor(gate_init))
+        self.mid_gate = nn.Parameter(torch.tensor(gate_init))
+        self.slow_gate = nn.Parameter(torch.tensor(gate_init))
 
     def initial_state(self, batch_size: int, device: torch.device) -> MultiTimescaleState:
         return MultiTimescaleState.zeros(
@@ -47,8 +86,12 @@ class ContinuousEncoder(nn.Module):
     def step(self, f_t: torch.Tensor, state: MultiTimescaleState) -> tuple[torch.Tensor, MultiTimescaleState]:
         """One 10 ms update. ``f_t``: ``[B, frontend.output_dim]`` -> latent ``z_t``: ``[B, latent_dim]``."""
         new_state = self.dynamics(f_t, state, self.step_seconds)
-        fused = torch.cat([new_state.fast, new_state.mid, new_state.slow], dim=-1)
-        z_t = self.to_latent(self.norm(fused))
+        z_t = (
+            self.w_x(f_t)
+            + self.fast_gate * self.fast_proj(new_state.fast)
+            + self.mid_gate * self.mid_proj(new_state.mid)
+            + self.slow_gate * self.slow_proj(new_state.slow)
+        )
         return z_t, new_state
 
     def forward(self, waveform: torch.Tensor, state: MultiTimescaleState | None = None) -> tuple[torch.Tensor, MultiTimescaleState]:

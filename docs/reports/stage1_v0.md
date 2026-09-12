@@ -2169,6 +2169,58 @@ mechanisms. Recommended next steps (not yet done, pending user decision):
    of writing) to confirm naturalness holds in the fully joint-trained
    setting, not just the frozen-encoder decoder-only test from Run 28.
 
+**Listening result (user):** "на слух идеально сейчас все" — confirms
+naturalness holds in the fully joint-trained Run 31 setting. Stage 1
+architecture considered validated on the single-clip testbed.
+
+---
+
+## Run 32 — Porting the validated architecture into `aevum.models`
+
+`ContinuousEncoder` (`src/aevum/models/encoder.py`) and `ContinuousDecoder`
+(`src/aevum/models/decoder.py`) previously still reflected the pre-fix
+design (cross-connections, no direct residual/gated fusion on the encoder;
+plain self-recurrent cells with no skip on the decoder) — every fix in this
+report had only been proven in standalone `overfit_*`/`diagnose_*` scripts.
+Ported the validated design (Runs 16-31) into the actual package classes:
+
+- `ContinuousEncoder`: `MultiTimescaleDynamics` now constructed with
+  `candidate_uses_hidden=False, disable_cross_connections=True` (Run 19/22
+  design — no cross-talk, no self-recurrence). Added the direct path
+  (`w_x`, identity-initialized when `latent_dim == frontend.output_dim`)
+  and per-branch gated projections (`fast_gate`/`mid_gate`/`slow_gate`,
+  `nn.Parameter` init 0.1). Default `latent_dim` changed from `None`-handled
+  to defaulting to the frontend's own output dim (384) rather than a fixed
+  512, so the identity init applies out of the box.
+- `ContinuousDecoder`: default `candidate_uses_hidden` changed from `True`
+  to `False` (Run 28's fix). Added the direct skip (`skip`, identity-init
+  when `event_dim == output_dim`) gated by a **fixed buffer**
+  `skip_gate=0.05` (`torch.Tensor`, not `nn.Parameter` — Run 26's
+  gate-collapse finding means this must not be trained). Default `event_dim`
+  changed from 512 to 384 to match the encoder's new default latent dim.
+- `DenseContinuousAutoencoder`: default `latent_dim` changed 512 -> 384 to
+  keep encoder output / decoder input / generator input dimensions
+  consistent by default (matching what Run 31 actually validated).
+
+All 8 existing tests still pass unchanged (explicit `latent_dim=512`/
+`event_dim=512` in `test_encoder_output_shape`/`test_decoder_output_shape`
+still work correctly — the identity-init just doesn't apply at that
+non-matching dimension, which is fine, a default-initialized linear layer
+still trains).
+
+Verified without training: `DenseContinuousAutoencoder()`'s gate values
+(0.1/0.1/0.1), decoder `skip_gate` (0.05, `requires_grad=False`), and both
+`w_x`/`skip`'s identity initialization all match Run 31's configuration
+exactly; parameter count (3,630,724) matches `overfit_full_pipeline_v4.py`'s
+count exactly, confirming the port is structurally identical, not just
+similar.
+
+**Verification in progress:** `scripts/sanity_overfit.py --source real
+--steps 500 --batch-size 1`, which now exercises `DenseContinuousAutoencoder`
+directly (not a standalone reimplementation), to confirm the ported package
+reproduces Run 31-like behavior before trusting it for a real LibriSpeech
+run.
+
 ---
 
 **Listening result (user), decisive:** the reconstruction from this run

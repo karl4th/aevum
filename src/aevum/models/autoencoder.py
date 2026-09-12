@@ -5,6 +5,14 @@ generator with no quantization, predictor, or event gate: every 10 ms step
 carries the full latent ``z_t`` straight to the decoder. This is the
 architectural sanity check that has to pass before anything else in the spec
 is worth building.
+
+Encoder and decoder both implement the direct-residual/gated-fusion fix
+validated end-to-end in docs/reports/stage1_v0.md (Runs 16-31) -- see their
+docstrings for the full rationale. Default ``latent_dim`` matches the
+frontend's own feature dimension (384) since that is the configuration
+actually validated (Run 31): it lets the encoder's direct path be
+identity-initialized and keeps ``z_t`` in the same space the decoder's own
+skip connection expects.
 """
 
 from __future__ import annotations
@@ -18,7 +26,7 @@ from aevum.models.generator import CausalWaveformGenerator
 
 
 class DenseContinuousAutoencoder(nn.Module):
-    def __init__(self, latent_dim: int = 512, decoder_output_dim: int = 384) -> None:
+    def __init__(self, latent_dim: int = 384, decoder_output_dim: int = 384) -> None:
         super().__init__()
         self.encoder = ContinuousEncoder(latent_dim=latent_dim)
         self.decoder = ContinuousDecoder(event_dim=latent_dim, output_dim=decoder_output_dim)
