@@ -202,7 +202,7 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
         for p in module.parameters():
             p.requires_grad_(False)
 
-    decoder = ContinuousDecoder(event_dim=dim, output_dim=dim).to(device)
+    decoder = ContinuousDecoder(event_dim=dim, output_dim=dim, candidate_uses_hidden=not args.no_decoder_self_recurrence).to(device)
     decoder_cells = {"fast": decoder.dynamics.fast_cell, "mid": decoder.dynamics.mid_cell, "slow": decoder.dynamics.slow_cell}
     w_skip_decoder = identity_conv1d(dim, device)
     generator = CausalWaveformGenerator(input_dim=dim).to(device)
@@ -220,6 +220,9 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
         gate_value, gate_trainable, label = args.decoder_gate_init, False, ablation
     else:  # baseline, fixed_gain
         gate_value, gate_trainable, label = args.decoder_gate_init, True, ablation
+
+    if args.no_decoder_self_recurrence:
+        label += "_no_dec_self_rec"
 
     gate_decoder = nn.Parameter(torch.tensor(gate_value, device=device)) if gate_trainable else torch.tensor(gate_value, device=device)
 
@@ -351,6 +354,12 @@ def main() -> None:
         "e.g. --gate-values 0.05 0.10 0.15 0.20",
     )
     parser.add_argument("--fixed-gain-target", type=float, default=1.0, help="target RMS for --ablation fixed_gain")
+    parser.add_argument(
+        "--no-decoder-self-recurrence",
+        action="store_true",
+        help="drop each decoder cell's own h_{t-1} from its candidate's input (cross-timescale inputs are unaffected); "
+        "tests whether decoder's self-recurrence contributes to the intermittent spikes seen with saturated hidden states (Run 27)",
+    )
     parser.add_argument("--data-root", type=str, default="data/raw")
     parser.add_argument("--librispeech-url", type=str, default="dev-clean")
     parser.add_argument("--index", type=int, default=0)

@@ -26,6 +26,7 @@ class MultiTimescaleDynamics(nn.Module):
         mid_dim: int = 192,
         slow_dim: int = 192,
         tau_ranges: dict[str, tuple[float, float]] | None = None,
+        candidate_uses_hidden: bool = True,
     ) -> None:
         super().__init__()
         tau_ranges = tau_ranges or {
@@ -41,9 +42,12 @@ class MultiTimescaleDynamics(nn.Module):
         self.mid_cross_slow = nn.Linear(slow_dim, slow_dim // 4)
         self.slow_cross = nn.Linear(mid_dim, mid_dim // 4)
 
-        self.fast_cell = ContinuousTimeCell(input_dim + mid_dim // 4, fast_dim, *tau_ranges["fast"])
-        self.mid_cell = ContinuousTimeCell(input_dim + fast_dim // 4 + slow_dim // 4, mid_dim, *tau_ranges["mid"])
-        self.slow_cell = ContinuousTimeCell(input_dim + mid_dim // 4, slow_dim, *tau_ranges["slow"])
+        # candidate_uses_hidden=False drops each cell's own h_{t-1} from its candidate's
+        # input (cross-branch inputs, part of x_t here, are unaffected) -- see
+        # docs/reports/stage1_v0.md Run 14 (encoder) and Run 27 (decoder) for why.
+        self.fast_cell = ContinuousTimeCell(input_dim + mid_dim // 4, fast_dim, *tau_ranges["fast"], candidate_uses_hidden=candidate_uses_hidden)
+        self.mid_cell = ContinuousTimeCell(input_dim + fast_dim // 4 + slow_dim // 4, mid_dim, *tau_ranges["mid"], candidate_uses_hidden=candidate_uses_hidden)
+        self.slow_cell = ContinuousTimeCell(input_dim + mid_dim // 4, slow_dim, *tau_ranges["slow"], candidate_uses_hidden=candidate_uses_hidden)
 
     def forward(self, f_t: torch.Tensor, state: MultiTimescaleState, dt: float) -> MultiTimescaleState:
         """One 10 ms update of all three branches given frontend features ``f_t``."""

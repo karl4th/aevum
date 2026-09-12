@@ -1885,6 +1885,98 @@ added next if useful.
 
 ---
 
+## Run 27 — Gate sweep (0.05/0.10/0.15/0.20) + g=0.05 at 2000 steps
+
+Added `--gate-values` to `diagnose_decoder_output_gain.py`: one command runs
+several fixed-gate values in sequence (`freeze_gate` mechanics,
+parameterized), each with its own `outputs/decoder_output_gain_gate_<g>/
+log.json`.
+
+**Sweep (1000 steps each), logged-record best loss (a loose upper bound —
+true per-step best, as established earlier, can be somewhat lower):**
+
+```text
+g=0.05: best~1.00, spikes>100: 1 (139 @ step110)
+g=0.10: best~1.01, spikes>100: 3 (up to 161 @ step230)
+g=0.15: best~1.22, spikes>100: 0  (smoothest of the four)
+g=0.20: best~1.76, spikes>100: 2 (up to 1214 @ step100 -- worst of the sweep)
+```
+
+Loss increases monotonically with `g` across this range; stability does
+*not* track `g` monotonically (0.15 smoothest, 0.20 worst).
+
+**Listening (user):** all four sound robotic to varying degrees; **0.05
+sounds relatively best.** (Initial apparent conflict — g=0.10 sounded
+"natural" as `freeze_gate` in Run 26 but "robotic" here as `gate_0.10` —
+was resolved as a comparison-set artifact, not a bug or nondeterminism
+issue: Run 26's "natural" was relative to {baseline, fixed_gain,
+no_temporal}, not an absolute judgment. Verified there's no code-path
+difference between the `freeze_gate` ablation and an equivalent
+`--gate-values` point before concluding this.)
+
+**g=0.05 extended to 2000 steps:** best loss improves further to **0.7232**
+(step 1970; final 0.8953). Listening: "немного роботизированность есть, но
+... на первый этап ... подойдет" (still some roboticness, but workable for
+Stage 1).
+
+### Detailed trajectory analysis (steps 0-420 of the 2000-step g=0.05 run)
+
+`fast_h_absmax`/`mid_h_absmax` reach ~0.98-1.0 by step ~130-200 and **stay
+saturated for the rest of the run**; `slow_h_absmax` follows by ~step
+200-230. Grad-norm spikes (120, 140, 230, 240, 260, 370, 380, 410 — the
+370 spike reaches **3573**, the 380 step's `generator_pretanh_absmax`
+reaches **2.26**, i.e. genuinely outside tanh's linear region for that one
+step) all occur *after* saturation is reached, not during the approach to
+it — this is instability *within* an already-saturated regime, not a
+runaway *toward* saturation. `to_output_weight_norm` grows steadily
+(11.3 -> ~13.8) but smoothly, with no sudden jump coincident with the worst
+spike — ruling out a `to_output`-weight jump as the proximate trigger for
+any single spike (though its slow growth may still be a contributing
+precondition).
+
+### Analysis — a previously untested variable: decoder's own self-recurrence
+
+Every fix applied to the decoder so far (Runs 20-26) added mechanisms
+*around* `ContinuousDecoder` (skip connections, gates) without ever
+modifying `ContinuousDecoder`'s own internal cells. Unlike the encoder
+(Runs 13-19, where `candidate_uses_hidden=False` was adopted after Run 14
+showed removing it alone didn't fix `mid`/`slow`, but it was kept anyway
+once paired with the residual fix, on the reasoning that no evidence
+existed it was needed), `ContinuousDecoder`'s three `ContinuousTimeCell`s
+still use the *default* `candidate_uses_hidden=True` (full self-recurrence
+via `W_hh*h_{t-1}` in the candidate) and default adaptive tau
+(`tau_t = f(x_t, h_{t-1})`) — this was never tested on the decoder side.
+Given the spikes occur specifically once hidden states are saturated (an
+extreme, boundary regime where a second self-referential recurrent pathway
+seems like a plausible place to look, per the user's original Run 13
+reasoning — which didn't pan out for the encoder, but was never checked for
+the decoder), this is a concrete, previously-untested, and cheap-to-test
+hypothesis.
+
+### Change made (additive, backward-compatible)
+
+Extended `MultiTimescaleDynamics.__init__` (`src/aevum/models/dynamics/
+multiscale.py`) with `candidate_uses_hidden: bool = True`, forwarded to its
+three internal `ContinuousTimeCell`s — cross-timescale connections (the
+`*_cross` projections) are unaffected, since those feed into each cell's
+`x_t`, not its `h_prev`; only each cell's *own* previous state is dropped
+from its candidate when set to `False`. `ContinuousDecoder.__init__` gained
+the same passthrough parameter (default `True`, i.e. unchanged behavior).
+`scripts/diagnose_decoder_output_gain.py` gained
+`--no-decoder-self-recurrence`, wiring this through and appending
+`_no_dec_self_rec` to the output label so it doesn't collide with existing
+runs. Verified: all 8 existing tests still pass, and a 3-step smoke test
+with the new flag runs cleanly with the expected smaller parameter count
+(1,901,953 vs 2,012,545 — the removed `h_prev` inputs to each cell's
+candidate `Linear` layer).
+
+Command: `uv run python scripts/diagnose_decoder_output_gain.py
+--gate-values 0.05 --no-decoder-self-recurrence --steps 2000` (directly
+comparable to the just-completed g=0.05/2000-step baseline above — same
+gate, same steps, only this one variable changed).
+
+---
+
 ## Cross-project note
 
 The general lesson from Runs 11-18 (a slow-decaying continuous-time state

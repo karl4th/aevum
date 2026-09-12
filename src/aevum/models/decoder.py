@@ -25,10 +25,11 @@ class ContinuousDecoder(nn.Module):
         slow_dim: int = 192,
         output_dim: int = 384,
         step_seconds: float = 0.01,
+        candidate_uses_hidden: bool = True,
     ) -> None:
         super().__init__()
         self.step_seconds = step_seconds
-        self.dynamics = MultiTimescaleDynamics(event_dim, fast_dim, mid_dim, slow_dim)
+        self.dynamics = MultiTimescaleDynamics(event_dim, fast_dim, mid_dim, slow_dim, candidate_uses_hidden=candidate_uses_hidden)
 
         fused_dim = fast_dim + mid_dim + slow_dim
         self.norm = nn.RMSNorm(fused_dim)
