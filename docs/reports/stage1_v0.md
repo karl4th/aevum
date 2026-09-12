@@ -1355,6 +1355,86 @@ Command: `uv run python scripts/overfit_full_pipeline_v2.py --steps 2000`
 
 ---
 
+## Run 20 — Full pipeline with fixed encoder: explodes again, now in the decoder
+
+`uv run python scripts/overfit_full_pipeline_v2.py --steps 2000` (fixed
+`fast+mid+slow`+direct-residual encoder from Run 19, unmodified
+`ContinuousDecoder` and `generator`):
+
+```text
+step    0  total  5.5305  grad_norm    16.011  gates ~0.10 each
+step  175  total  3.8405  grad_norm    13.204  best 3.7050
+step  200  total  3.9849  grad_norm   174.267  best 3.6237
+step  225  total  6.2082  grad_norm   617.740
+step  350  total  4.5261  grad_norm   463.687
+step  375  total  7.8169  grad_norm   737.637
+step  450  total  3.4173  grad_norm    84.384  best 3.1449   <- best of the whole run
+step  600  total  6.7742  grad_norm 19545.418  (largest grad_norm in this entire investigation)
+step  700  total 13.8431  grad_norm  3359.545
+step  775  total 19.3905  grad_norm  3684.843
+step  825  total  9.0613  grad_norm 13694.688
+step  850  total  5.3479  grad_norm     5.488  <- "calm" from here on
+step 1999  total  5.3454  grad_norm     1.183  wav=0.0431 (near the "silence" value seen at step 0 of Run 4)
+```
+
+Gates drift upward throughout the unstable region (`g_fast` 0.099->0.11+,
+`g_slow` 0.10->0.15+) before the run settles into a low-gradient plateau at
+`total~5.34` — worse than the run's own best (3.1449) and barely better
+than step 0 (5.5305). This late "calm" phase is not convergence; it looks
+like collapse into a degenerate near-silent solution (matching the
+`wav~0.043`, "mostly silence" signature first seen at step 0 of Run 4/8,
+before any real training).
+
+### Analysis
+
+**The exact failure signature from Runs 4/5/8/11 reappears, one level
+downstream.** The encoder fix (Run 16-19) is confirmed working in isolation
+(`encoder -> generator` direct, no decoder, was clean in Run 19). Reading
+`src/aevum/models/decoder.py` confirms `ContinuousDecoder` is architecturally
+identical to the *pre-fix* encoder in the relevant way: it feeds
+`MultiTimescaleDynamics` (default `candidate_uses_hidden=True`, active
+cross-timescale connections, adaptive tau) and produces output purely as
+`to_output(norm(fused fast/mid/slow states))` — **no direct path from the
+input `u_t`/`z_t` to the output at all.** This is precisely the
+"slow-decaying state forced to be the sole transport channel" pattern
+already diagnosed and fixed on the encoder side (see
+`../lessons-continuous-time-dynamics.md`), now hitting the decoder instead:
+the encoder is producing meaningful full-bandwidth `z_t`, and the decoder
+has no way to pass it through without funneling everything through its own
+low-bandwidth mid/slow states.
+
+This also validates the decoder-side design insight queued back in Run
+10/18's analysis ("give the decoder a direct event-injection path too") —
+it wasn't just a nice-to-have symmetry argument, it's now empirically
+necessary.
+
+### Next step — same fix, decoder side, decoder itself untouched first
+
+Following the same economical approach that worked for the encoder (Run
+16: adding the residual alone fixed `mid` without first touching
+self-recurrence or tau) — add a direct skip from `z_t` to the generator
+input, alongside (not instead of) `ContinuousDecoder`'s own output,
+**without modifying `ContinuousDecoder` itself yet**:
+
+```text
+y_for_generator = ContinuousDecoder(z_t) + g_decoder * W_skip(z_t)
+```
+
+`W_skip` identity-initialized (same trick as `W_x` on the encoder side),
+`g_decoder` small-init (~0.1), so training starts close to a system where
+`ContinuousDecoder`'s output barely matters and has to earn its
+contribution — mirroring the encoder recovery exactly.
+
+Implemented in `scripts/overfit_full_pipeline_v3.py` (not yet run/verified).
+If this stabilizes, the decoder's own internal self-recurrence/cross-
+connections/adaptive-tau can stay as-is (no need to repeat the whole
+single-branch ablation sequence on the decoder side, unless this simple fix
+doesn't work).
+
+Command: `uv run python scripts/overfit_full_pipeline_v3.py --steps 2000`.
+
+---
+
 ## Cross-project note
 
 The general lesson from Runs 11-18 (a slow-decaying continuous-time state
