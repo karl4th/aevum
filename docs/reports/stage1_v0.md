@@ -2033,6 +2033,26 @@ further, the two remaining spikes are likely just normal early-training
 noise, and the current state (best loss 0.5693, clean for 85% of the run)
 would be considered good enough to move forward.
 
+**Listening result (user), decisive:** the reconstruction from this run
+"на слух очень хорошая... роботизированность тоже исчезла" — sounds very
+good, and the robotic quality that persisted through *every* prior decoder
+configuration in this entire investigation (Runs 20-27: baseline,
+freeze_gate, fixed_gain, no_temporal, the whole gate sweep at every tested
+value) is gone. This is the first decoder configuration in the entire
+Run 20-28 arc that resolves naturalness, not just loss/stability. Combined
+with the objective numbers above (best loss of any decoder config tested
+on this clip, zero hidden-state saturation, spikes cut ~11.6x), this
+reframes the finding: decoder self-recurrence wasn't only a stability bug —
+it was very plausibly *the* mechanism suppressing naturalness this whole
+time. A saturated (~±1) hidden state is close to binary/two-valued and can
+carry little graded, continuous information; without self-recurrence
+forcing saturation, the state stays in a continuous regime apparently far
+better suited to carrying prosodic/micro-dynamic nuance. This retroactively
+reframes Run 26's "gate-collapse" story too: suppressing the temporal
+branch's gate may have been the optimizer's way of limiting exposure to a
+*pathological* (saturated, low-information) temporal signal, not
+necessarily rejecting temporal information in general.
+
 ---
 
 ## Cross-project note
