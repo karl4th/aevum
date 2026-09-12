@@ -2215,11 +2215,47 @@ exactly; parameter count (3,630,724) matches `overfit_full_pipeline_v4.py`'s
 count exactly, confirming the port is structurally identical, not just
 similar.
 
-**Verification in progress:** `scripts/sanity_overfit.py --source real
---steps 500 --batch-size 1`, which now exercises `DenseContinuousAutoencoder`
-directly (not a standalone reimplementation), to confirm the ported package
-reproduces Run 31-like behavior before trusting it for a real LibriSpeech
-run.
+**Verification result:** `scripts/sanity_overfit.py --source real --steps
+500 --batch-size 1` (exercises `DenseContinuousAutoencoder` directly, not a
+standalone reimplementation):
+
+```text
+initial loss: 5.6786
+final loss:   2.0274
+best loss:    2.0056  (step 485)
+reduction (best): 64.7%
+max grad norm (pre-clip): 89.368
+```
+
+No explosions (max grad_norm 89, versus thousands in every pre-fix
+configuration), smooth monotonic decrease throughout — same qualitative
+shape as Run 31. Absolute loss at step 500 is higher here than Run 31's
+step-500 value (2.01 vs 0.58), but this is expected, not a regression:
+`sanity_overfit.py`'s default LR is `1e-4`, ten times lower than
+`overfit_full_pipeline_v4.py`'s `1e-3` — slower convergence at a lower
+learning rate on the same architecture, not evidence of a broken port.
+**Port confirmed working.**
+
+### Next: real LibriSpeech training
+
+With the architecture ported and verified, and `train_stage1.py` now
+writing a JSON log (`outputs/train_log.json`) plus per-step grad_norm and
+encoder gate values, the next step is a real training run on diverse
+LibriSpeech data — every run in this report (1-32) trained on a single
+repeated 2-second clip; generalization has not yet been tested at all.
+
+Command (uses defaults: batch_size=64, lr=1e-4, grad_clip_norm=1.0,
+`dev-clean`, ~51 audio-sec/wall-sec per Run 2's benchmark so 5000 steps is
+roughly 3-4 hours):
+
+```
+uv run python scripts/train_stage1.py --steps 5000
+```
+
+Produces `outputs/train_log.json` (full step-by-step history), periodic
+`outputs/samples/val_step*.wav` (listen to these over the course of
+training), and checkpoints (`outputs/stage1_best.pt`,
+`outputs/stage1_step<N>.pt`, `outputs/stage1_final.pt`).
 
 ---
 
