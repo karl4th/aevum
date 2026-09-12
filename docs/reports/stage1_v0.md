@@ -1977,6 +1977,64 @@ gate, same steps, only this one variable changed).
 
 ---
 
+## Run 28 — Decoder self-recurrence removed: large improvement, not fully resolved
+
+`uv run python scripts/diagnose_decoder_output_gain.py --gate-values 0.05
+--no-decoder-self-recurrence --steps 2000` (user granted permission to run
+this and the following steps autonomously). Directly comparable to Run 27's
+g=0.05/2000-step run — identical everything else.
+
+```text
+                          with self-recurrence (Run 27)   without (this run)
+best loss                 0.7232                           0.5693
+max grad_norm              3573.21 @ step 370                307.85 @ step 110
+spikes > 50                8 (up to step 410)                2 (both < step 300)
+max fast_h_absmax           ~1.0000 (saturated, held)         0.5127 (never saturates)
+max mid_h_absmax            ~1.0000 (saturated, held)         0.3667
+max slow_h_absmax           ~0.996  (saturated, held)         0.1482
+waveform_saturation_fraction 0.0                              0.0
+```
+
+After step ~300, the run is completely clean for the remaining ~1700 steps
+(grad_norm 3-25, monotonic improvement from loss 3.33 to 0.62). Hidden
+state absmax values are not just lower — they're *stable* throughout
+(fast_h_absmax barely moves, 0.43-0.51 from step 400 onward) rather than
+climbing to a ceiling and staying pinned there.
+
+### Analysis
+
+**Hypothesis confirmed, substantially.** Removing the decoder cells' own
+`h_{t-1}` from their candidate input eliminates hidden-state saturation
+entirely and removes 6 of 8 grad_norm spikes (the remaining 2 are both
+pre-step-300, before any saturation-driven mechanism could even apply),
+cutting the worst spike by ~11.6x and improving best loss by 21%. This is
+a real, large-effect fix, not noise — directly analogous to (though
+empirically distinct in mechanism from) the encoder-side finding: on the
+encoder,
+removing self-recurrence alone did *not* fix instability (Run 14) — the
+real fix there was the transport-channel/residual issue. On the decoder,
+self-recurrence removal *does* meaningfully help, on top of the
+already-applied skip/gate fix — suggesting the decoder's remaining
+instability had at least two contributing factors, of which self-
+recurrence was a substantial one.
+
+**Not fully resolved:** two spikes remain, both early (step 110 and 260,
+before any hidden-state saturation would even be possible at this
+point in training) — these look like ordinary early-training transients
+rather than the saturated-state pathology from Run 27, but this is not
+confirmed.
+
+### Next step
+
+Per the plan: test decoder-side fixed tau next (`--decoder-fixed-tau`,
+already implemented in Run 27's infra), same g=0.05, same 2000 steps, to
+see if it removes the two remaining early spikes. If it doesn't help
+further, the two remaining spikes are likely just normal early-training
+noise, and the current state (best loss 0.5693, clean for 85% of the run)
+would be considered good enough to move forward.
+
+---
+
 ## Cross-project note
 
 The general lesson from Runs 11-18 (a slow-decaying continuous-time state
