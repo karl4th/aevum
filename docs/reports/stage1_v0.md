@@ -1435,6 +1435,125 @@ Command: `uv run python scripts/overfit_full_pipeline_v3.py --steps 2000`.
 
 ---
 
+## Run 21 — Full pipeline v3 (decoder + skip): still explodes
+
+`uv run python scripts/overfit_full_pipeline_v3.py --steps 2000`:
+
+```text
+step    0  total  5.7578  grad_norm    23.677  g_decoder=0.0990
+step   25  total  5.3781  grad_norm    10.731  g_decoder=0.0862
+step   50  total  5.4070  grad_norm    74.011  g_decoder=0.0839
+step   75  total  5.2789  grad_norm     1.598  g_decoder=0.0795
+step  100  total 10.0228  grad_norm  1594.308  g_decoder=0.0722
+```
+(stopped by the user — clearly diverging again)
+
+### Analysis
+
+The simple decoder-side skip (mirroring the encoder fix exactly) was not
+enough on its own. Notable: `g_decoder` fell monotonically (0.099 -> 0.072)
+in the steps *before* the explosion — the optimizer appears to be trying to
+suppress `ContinuousDecoder`'s own dynamics contribution, similar in spirit
+to the gate behavior that preceded instability in earlier encoder-side
+explosions. User's read: this doesn't yet prove decoder's forward dynamics
+are broken on their own — it could still be a gradient-coupling effect
+between the (still jointly training, still-shifting) encoder output
+distribution and the decoder, rather than a forward-capacity problem. User
+decided: stop modifying the encoder entirely (it will be re-verified, not
+touched further) and isolate the decoder specifically, the same way the
+encoder was isolated in Runs 9-19.
+
+---
+
+## Run 22 — Re-verifying the encoder-only test to full 2000 steps
+
+Since Runs 20/21 (with decoder) both looked clean for the first ~75-600
+steps before exploding, "looked stable at step 500" is no longer sufficient
+evidence on its own. Re-ran Run 19's exact configuration
+(`scripts/overfit_multiscale_encoder.py`, no decoder) to the full 2000
+steps instead of stopping early:
+
+```text
+step    0  total 5.7583  grad_norm 24.081
+step  500  total 0.7069  grad_norm 11.013  best 0.6919
+step 1000  total 0.4157  grad_norm  5.370  best 0.3984
+step 1500  total 0.2809  grad_norm  8.562  best 0.2785
+step 1999  total 0.2307  grad_norm 11.862  best 0.2295
+```
+
+`grad_norm` stayed in the calm 4-14 range for the *entire* 2000-step run —
+no explosion at any point, unlike every decoder-involving configuration.
+Loss decreased essentially monotonically to a new best (0.2295) — lower
+than any single-branch result on this clip. Gates settled and stayed stable
+long-term (`g_fast~0.06`, `g_mid~0.11`, `g_slow~0.11`, no drift toward
+instability across the full run).
+
+### Analysis
+
+**The fast+mid+slow+direct-residual encoder is now fully cleared, at the
+duration that matters.** It does not just look stable early — it remains
+stable for the complete 2000-step budget the decoder-involving runs failed
+within. Combined with Run 21, the investigation now narrows entirely to
+`ContinuousDecoder` and/or the encoder-decoder interface — not the encoder
+itself, and no further encoder modification is planned.
+
+### Next step — binary isolation of decoder capacity vs. gradient coupling
+
+User's plan, mirroring the encoder isolation methodology exactly:
+
+1. **Free learnable latent -> decoder v3 (with skip) -> generator**, run to
+   the full 2000 steps this time (Run 10 tested the plain decoder, no skip,
+   only to ~400 steps). If this explodes, `ContinuousDecoder` itself
+   (forward dynamics, independent of what feeds it) cannot handle sustained
+   training — decoder capacity is the problem.
+2. **Encoder (frozen, random init, no gradient) -> decoder v3 -> generator**:
+   the encoder computes `z_t` from real audio using the same
+   fast+mid+slow+direct-residual architecture, but is *not* trained — its
+   output is detached before reaching the decoder, so only
+   decoder+skip+generator receive gradients. This tests whether decoder can
+   learn to reconstruct from a *fixed* real-audio-derived representation
+   (structured, but not adversarially co-adapted to the decoder). If this
+   also explodes, decoder can't handle even a fixed/non-shifting version of
+   this kind of representation. If it stays stable, the problem is
+   specifically the *joint* training dynamics / gradient coupling between
+   encoder and decoder — not decoder's forward capacity in isolation.
+
+Scripts: `scripts/overfit_decoder_v3_free_latent.py` and
+`scripts/overfit_frozen_encoder_decoder.py` (both not yet run).
+
+---
+
+## Run 23/24 (setup) — Both decoder isolation scripts written and smoke-tested
+
+**Test 1** (`scripts/overfit_decoder_v3_free_latent.py`, Run 23): free
+learnable `Z [1, T, 384]` -> `ContinuousDecoder` + skip (identical
+construction to Run 21's decoder side) -> `generator`, run to the full 2000
+steps this time (Run 10 only went to ~400). 2-step smoke test: runs
+cleanly, sane loss/grad_norm (5.74, then 6.85 — normal step-0/1 noise
+matching every other run's start).
+
+**Test 2** (`scripts/overfit_frozen_encoder_decoder.py`, Run 24): the
+fast+mid+slow+direct-residual encoder (identical construction to
+`overfit_multiscale_encoder.py`/Run 19/22) built at random init and frozen
+— all its parameters have `requires_grad_(False)`, its forward pass is
+wrapped in `torch.no_grad()`, and `z_t` is computed *once* before the
+training loop (it never changes, since nothing upstream of it ever
+updates). Only `ContinuousDecoder` + skip + `generator` are trained. 2-step
+smoke test: runs cleanly; step 0 loss (5.7578) matches Run 20/21's step 0
+exactly, as expected — same random seed producing the same frozen encoder
+init.
+
+Both scripts write to their own `outputs/` subdirectories and are ready to
+run to completion.
+
+**Commands:**
+```
+uv run python scripts/overfit_decoder_v3_free_latent.py --steps 2000
+uv run python scripts/overfit_frozen_encoder_decoder.py --steps 2000
+```
+
+---
+
 ## Cross-project note
 
 The general lesson from Runs 11-18 (a slow-decaying continuous-time state
