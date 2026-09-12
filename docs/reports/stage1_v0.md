@@ -2056,6 +2056,49 @@ test disabling decoder cross-connections *on top of Run 28's config*
 (self-recurrence off, adaptive tau) — not on top of the now-discarded
 fixed-tau config.
 
+**Result: mixed, not a clear win.**
+`--no-decoder-self-recurrence --disable-decoder-cross-connections`, same
+g=0.05, 2000 steps:
+
+```text
+                        Run 28 (self-rec off only)   + cross-connections off
+best loss               0.5693                        0.6463  (worse)
+max grad_norm           307.85 @ step 110              182.06 @ step 130  (smaller peak)
+spikes > 50              2                              9  (more total spikes)
+max fast_h_absmax        0.5127                         0.3257  (even less saturated)
+max mid_h_absmax         0.3667                         0.2385
+max slow_h_absmax        0.1482                         0.0850
+```
+
+Removing cross-connections lowers the single worst spike (182 vs 308) and
+pushes hidden states even further from saturation, but produces *more*
+total spikes (9 vs 2) and a worse best loss. Net effect: a wash, not a
+clear improvement — no strong evidence cross-connections contribute to the
+instability in a way worth losing them for (cross-timescale communication
+is architecturally meaningful per tech_spec.md section 9, and Run 28
+already achieves the main goals: natural-sounding audio and near-total
+elimination of saturation/spikes).
+
+### Conclusion — final Stage 1 decoder configuration
+
+**`candidate_uses_hidden=False` on the decoder's cells (self-recurrence
+removed), adaptive tau kept, cross-connections kept, gate fixed at
+`g=0.05`** is the configuration going forward. This single change (removing
+decoder self-recurrence) fixed both the numerical instability chain
+(Runs 20-27) and — decisively, confirmed by listening — the naturalness
+problem that no amount of gate-tuning alone could fix (Run 26's whole gate
+sweep). Fixed tau and disabled cross-connections were both tested on top
+of this and neither improved on it (fixed tau was an outright regression;
+disabled cross-connections was a wash).
+
+### Next step
+
+Run the full `audio -> encoder -> decoder -> generator` pipeline once more
+on the same single clip, now with this final decoder configuration, to
+confirm the fix holds end-to-end (not just decoder-in-isolation with a
+frozen encoder) before considering Stage 1 architecture work complete and
+moving toward LibriSpeech training / package integration.
+
 **Listening result (user), decisive:** the reconstruction from this run
 "на слух очень хорошая... роботизированность тоже исчезла" — sounds very
 good, and the robotic quality that persisted through *every* prior decoder
