@@ -58,21 +58,25 @@ class ContinuousTimeCell(nn.Module):
         self._recording = False
         self._tau_log: list[torch.Tensor] = []
         self._alpha_log: list[torch.Tensor] = []
+        self._candidate_log: list[torch.Tensor] = []
 
     def start_recording(self) -> None:
-        """Begin accumulating per-step tau/alpha values (for diagnostics only)."""
+        """Begin accumulating per-step tau/alpha/candidate-pre-tanh values (for diagnostics only)."""
         self._recording = True
         self._tau_log = []
         self._alpha_log = []
+        self._candidate_log = []
 
     def stop_recording(self) -> dict[str, torch.Tensor]:
-        """Stop accumulating and return the flattened tau/alpha values seen since ``start_recording``."""
+        """Stop accumulating and return the flattened tau/alpha/candidate-pre-tanh values seen since ``start_recording``."""
         self._recording = False
         tau = torch.cat(self._tau_log) if self._tau_log else torch.empty(0)
         alpha = torch.cat(self._alpha_log) if self._alpha_log else torch.empty(0)
+        candidate_pretanh = torch.cat(self._candidate_log) if self._candidate_log else torch.empty(0)
         self._tau_log = []
         self._alpha_log = []
-        return {"tau": tau, "alpha": alpha}
+        self._candidate_log = []
+        return {"tau": tau, "alpha": alpha, "candidate_pretanh": candidate_pretanh}
 
     def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor, dt: float) -> torch.Tensor:
         """Advance the state by one observation step of size ``dt`` seconds.
@@ -86,7 +90,11 @@ class ContinuousTimeCell(nn.Module):
             ``[B, hidden_dim]`` updated hidden state.
         """
         xh = torch.cat([x_t, h_prev], dim=-1)
-        u_t = torch.tanh(self.candidate(xh if self.candidate_uses_hidden else x_t))
+        candidate_logit = self.candidate(xh if self.candidate_uses_hidden else x_t)
+        u_t = torch.tanh(candidate_logit)
+
+        if self._recording:
+            self._candidate_log.append(candidate_logit.detach().flatten())
 
         if self.adaptive_tau:
             tau_input = xh if self.tau_uses_hidden else x_t

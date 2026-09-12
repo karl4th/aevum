@@ -1654,6 +1654,130 @@ uv run python scripts/overfit_decoder_v3_free_latent.py --steps 2000
 
 ---
 
+## Run 25 — `--normalize none` and `--normalize rmsnorm`: hidden state is bounded, the growth is downstream
+
+**`--normalize none`** (raw frozen z, rms 0.0119): `decoder_in_rms` stays flat
+at 0.0119 the whole run (as expected — z never changes). But `fast_h_rms`/
+`mid_h_rms` grow steadily (0.026 -> 0.42 and 0.022 -> 0.53 by step 200) with
+`absmax` approaching ~0.99, and `generator_in_rms` grows in step
+(0.56 -> 0.93 -> 1.86 -> ~1.1-1.4) with large `grad_norm` spikes (438 @
+step75, 827 @ step100, 2736 @ step150, 2834 @ step200) occurring right when
+`fast_h`/`mid_h` are near their local peaks.
+
+**`--normalize rmsnorm`** (z rescaled to rms~1.0): `fast_h_absmax` and
+`mid_h_absmax` reach **1.0000 by step 10** and stay saturated there for the
+remaining 290+ logged steps — yet `grad_norm` still spikes repeatedly (49,
+193, 254, 1893, 848, 720, 164, 1502...) and loss still blows up
+(e.g. 25.98 at step 275). Rescaling the input did not fix the instability.
+
+### Analysis (refined by the user)
+
+`h_t = alpha*h_{t-1} + (1-alpha)*tanh(...)` is provably a convex combination
+of two values in `[-1, 1]`, so `h` cannot itself diverge — the observed
+saturation (`absmax -> 1.0`, held for hundreds of steps) confirms this
+directly rather than just by construction. **The hidden state is bounded
+and stops being the source of unbounded growth; user's correction: bounded
+does not mean "not moving" (individual coordinates can still flip within
+`[-1,1]`), but it does rule out hidden amplitude itself as the source of
+*unbounded* growth.** The real growing, unbounded quantity is
+`generator_in_rms`, which must come from what happens *after* `h`:
+`ContinuousDecoder.to_output` (an unconstrained `Linear`) and/or the
+learnable `gate_decoder`. A bounded `h` can still produce arbitrarily large
+`to_output(h)` if `to_output`'s weights grow — `||h|| <= 1` says nothing
+about `||W_out|| `.
+
+User's mechanism hypothesis: hidden saturation kills the candidate's
+gradient (`d(tanh)/da -> 0` near saturation), so the optimizer can no longer
+usefully adjust representational *structure* through `h` — it finds a
+cheaper way to keep reducing loss by growing `to_output`'s *gain* instead.
+Eventually `generator_in` grows enough to push the generator's own final
+`tanh` into saturation too, producing a near-clipped waveform with badly
+wrong spectral content, which the log-compressed mel/STFT loss reacts to
+explosively (matching the step-275 log: `wav_loss~0.97`, `stft_loss~22.2`
+at `generator_in_rms~2`).
+
+```text
+decoder hidden saturation -> downstream gain compensation (to_output/gate)
+  -> generator input amplitude growth -> generator's own tanh saturation
+  -> spectral catastrophe (huge log-compressed mel/STFT loss + gradient)
+```
+
+Explicit scope note (user): this is treated as a **Stage 1 optimization
+pathology to fix**, not evidence against the AEVUM concept — no
+innovation/event-gate architecture changes are being considered based on
+this.
+
+---
+
+## Run 26 (setup) — Decompose `generator_in` and ablate the output-gain path
+
+One script, `scripts/diagnose_decoder_output_gain.py`, tests every
+hypothesis from the discussion above in a single tool, each run capped at
+1000 steps, logging a full JSON record (not just console output) every
+`--log-every` steps.
+
+**Decomposition logged every step** (`generator_in = skip(z) + gate_decoder
+* temporal_raw`, where `temporal_raw` is `ContinuousDecoder`'s own
+`to_output(norm(fused))` output before gating): `skip_rms/absmax`,
+`temporal_raw_rms/absmax` (decoder's raw output, always un-ablated so it's
+comparable across all four modes), `temporal_gated_rms/absmax` (the actual
+contribution reaching the generator, reflecting whichever ablation is
+active), `to_output_weight_norm/absmax` (direct check of user's Variant A:
+is `to_output`'s weight itself growing?), `generator_in_rms/absmax`,
+`generator_pretanh_rms/absmax` (via a new `generator_forward_with_pretanh`
+helper replicating `CausalWaveformGenerator.forward` up to before its final
+`tanh`), `waveform_rms`, and `waveform_saturation_fraction` (`(|wav| >
+0.95).mean()`). Also extended `ContinuousTimeCell` (`src/aevum/models/
+dynamics/cell.py`) to optionally record the candidate's pre-tanh logit
+alongside the existing tau/alpha recording (same opt-in
+`start_recording()`/`stop_recording()` mechanism from Run 6, additive, all
+existing tests still pass) — logged here as `{fast,mid,slow}_pretanh_rms/
+absmax`, to check whether the *candidate* itself (not just `h`) is
+saturating.
+
+**`--ablation`** selects one of four configurations, always with identical
+logging, so they're directly comparable:
+
+- `baseline` — `gate_decoder` trainable (init 0.1), `to_output`
+  unconstrained. Reproduces Run 25's instability with full instrumentation.
+- `freeze_gate` — `gate_decoder` fixed at 0.1, excluded from the optimizer.
+  Tests whether the gate itself is what grows the contribution (if
+  `generator_in` still grows here, the gate isn't the driver — points at
+  `to_output`'s own weights, the user's Variant A).
+- `fixed_gain` — `temporal_raw` is rescaled to a fixed target RMS (default
+  1.0) using a **detached** RMS statistic (not a learnable norm — explicitly
+  diagnostic, not a production design) before gating. Tests whether
+  removing unconstrained downstream gain removes the spikes.
+- `no_temporal` — `gate_decoder` fixed at **0.0**, excluded from the
+  optimizer: only `skip(z)` reaches the generator. `ContinuousDecoder`'s
+  dynamics still compute (and its parameters still exist/receive whatever
+  gradient flows to them, which is ~zero) but never contribute to the
+  output. If this is stable for the full 1000 steps, the temporal/
+  `to_output` branch is definitively the culprit, not `skip` (user's
+  Variant C ruled out simultaneously).
+
+All four verified with 3-step smoke tests: no errors, and the ablation
+mechanics already show the expected qualitative behavior even at this
+scale — `freeze_gate` holds `g_decoder` exactly at 0.1000 across steps
+(vs. baseline's 0.1010 -> 0.0996 drift), `fixed_gain` holds
+`temporal_gated_rms` essentially constant at ~0.10 (`fixed_gain_target *
+g_decoder`) even as `temporal_raw_rms` itself grows (0.559 -> 0.789 -> 0.772
+across the 3 steps), and `no_temporal` gives `temporal_gated_rms == 0.0000`
+exactly with `generator_in_rms` equal to `skip_rms` to 4 decimal places, as
+required by construction. JSON logs (`log.json` in each ablation's
+`outputs/` subdirectory) verified to parse correctly with all 34 expected
+fields per record.
+
+**Commands (each capped at 1000 steps):**
+```
+uv run python scripts/diagnose_decoder_output_gain.py --ablation baseline --steps 1000
+uv run python scripts/diagnose_decoder_output_gain.py --ablation freeze_gate --steps 1000
+uv run python scripts/diagnose_decoder_output_gain.py --ablation fixed_gain --steps 1000
+uv run python scripts/diagnose_decoder_output_gain.py --ablation no_temporal --steps 1000
+```
+
+---
+
 ## Cross-project note
 
 The general lesson from Runs 11-18 (a slow-decaying continuous-time state
