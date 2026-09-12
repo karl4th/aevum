@@ -202,7 +202,13 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
         for p in module.parameters():
             p.requires_grad_(False)
 
-    decoder = ContinuousDecoder(event_dim=dim, output_dim=dim, candidate_uses_hidden=not args.no_decoder_self_recurrence).to(device)
+    decoder = ContinuousDecoder(
+        event_dim=dim,
+        output_dim=dim,
+        candidate_uses_hidden=not args.no_decoder_self_recurrence,
+        adaptive_tau=not args.decoder_fixed_tau,
+        disable_cross_connections=args.disable_decoder_cross_connections,
+    ).to(device)
     decoder_cells = {"fast": decoder.dynamics.fast_cell, "mid": decoder.dynamics.mid_cell, "slow": decoder.dynamics.slow_cell}
     w_skip_decoder = identity_conv1d(dim, device)
     generator = CausalWaveformGenerator(input_dim=dim).to(device)
@@ -223,6 +229,10 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
 
     if args.no_decoder_self_recurrence:
         label += "_no_dec_self_rec"
+    if args.decoder_fixed_tau:
+        label += "_dec_fixed_tau"
+    if args.disable_decoder_cross_connections:
+        label += "_no_dec_cross"
 
     gate_decoder = nn.Parameter(torch.tensor(gate_value, device=device)) if gate_trainable else torch.tensor(gate_value, device=device)
 
@@ -359,6 +369,18 @@ def main() -> None:
         action="store_true",
         help="drop each decoder cell's own h_{t-1} from its candidate's input (cross-timescale inputs are unaffected); "
         "tests whether decoder's self-recurrence contributes to the intermittent spikes seen with saturated hidden states (Run 27)",
+    )
+    parser.add_argument(
+        "--decoder-fixed-tau",
+        action="store_true",
+        help="replace each decoder branch's learned adaptive tau with a constant (that branch's own tau_range midpoint), "
+        "removing the h_{t-1} -> tau_t -> alpha_t feedback path; mirrors Run 15's encoder test, applied to the decoder",
+    )
+    parser.add_argument(
+        "--disable-decoder-cross-connections",
+        action="store_true",
+        help="remove cross-timescale connections between decoder's fast/mid/slow branches (each cell only sees its own state); "
+        "tests whether saturated cross-branch signals amplify instability (Run 27)",
     )
     parser.add_argument("--data-root", type=str, default="data/raw")
     parser.add_argument("--librispeech-url", type=str, default="dev-clean")
