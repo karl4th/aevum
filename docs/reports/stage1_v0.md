@@ -2292,3 +2292,102 @@ continuous-time/leaky-integrator recurrent component and may be relevant to
 other Manifestro projects.
 
 ---
+
+## Real LibriSpeech training, attempt 2: with LR scheduler (in progress)
+
+Resumed from `outputs/stage1_best.pt` with the new `--lr-scheduler plateau`
+default:
+
+```
+uv run python scripts/train_stage1.py --steps 5000 --resume outputs/stage1_best.pt --lr-scheduler plateau
+```
+
+First 300 steps:
+
+| step | total  | grad_norm (pre-clip) | lr      |
+|------|--------|-----------------------|---------|
+| 0    | 2.6905 | 10.098                | 1.00e-4 |
+| 50   | 2.7602 | 3.683                 | 1.00e-4 |
+| 100  | 2.8862 | 31.468                | 1.00e-4 |
+| 150  | 2.7639 | 5.932                 | 1.00e-4 |
+| 200  | 2.7525 | 16.440                | 1.00e-4 |
+| 250  | 2.7003 | 12.745                | 1.00e-4 |
+| 300  | 2.5756 | 9.130                 | 1.00e-4 |
+
+val at step 0: loss 4.0757 (best inf).
+
+User's read at this point: "no change, same stuck spot" -- but step 300 is
+the lowest total loss of the entire run, so this is noisy improvement, not
+a stall, when judged by raw per-step numbers.
+
+**Two things worth naming explicitly before drawing any conclusion:**
+
+1. 300 steps on `dev-clean` (batch 64 x 2s = 128 audio-s/step, ~152
+   steps/epoch) is under 2 epochs. Real batches vary in speaker/content
+   every step, unlike every prior run in this report (all single repeated
+   clip) -- some step-to-step noise band is expected, and judging by raw
+   printed points rather than a smoothed/val trend is likely to look like
+   "stuck" even when the underlying trend is improving.
+2. `ReduceLROnPlateau` cannot have acted yet: `--lr-patience 3` counts val
+   checks (`--sample-every 500`), and only one val check (step 0) has
+   happened. Earliest possible LR cut is ~step 2000. The "did the scheduler
+   help" question is not yet answerable from this data.
+
+**Open hypothesis, not yet confirmed:** pre-clip grad_norm swings 3.7-31.5
+while `--grad-clip-norm` caps at 1.0 -- most steps are being scaled down by
+3-30x. Run 32's single-clip `sanity_overfit` diagnostic saw similarly large
+pre-clip norms (max 89) without blocking convergence, so clipping this hard
+isn't automatically fatal -- but on diverse real batches it may be
+throttling effective step size more than intended, in which case cutting
+LR further (what the plateau scheduler does) would compound the problem
+rather than fix it. Not acted on yet; flagged for when there's enough data
+to check whether grad_norm distribution correlates with the noisy-loss
+steps.
+
+**Next checkpoint:** let this run continue past step ~2000-3000 before
+judging the scheduler or the grad-clip hypothesis -- there isn't enough
+data yet for either.
+
+### Update: trend is real but very slow (regression on steps 0-450)
+
+More data came in (steps 300-450):
+
+| step | total  | grad_norm (pre-clip) |
+|------|--------|-----------------------|
+| 350  | 2.7498 | 33.590                |
+| 400  | 2.7053 | 39.525                |
+| 450  | 2.7391 | 10.726                |
+
+Least-squares linear fit of total loss vs step over all 10 points
+(0..450): slope approx -0.00015/step (intercept-relative, i.e. ~-0.07
+total over 450 steps). This matches the "mountain, not a slope" visual
+read -- there is a real but tiny downward trend buried in +-0.15 noise.
+Extrapolating this (linear, likely optimistic) rate to loss ~1 (the level
+at which speech became audible in every single-clip run, e.g. Run 31)
+would need roughly 11-12k steps, i.e. 9-10+ hours at current throughput
+(~3s/step) -- too expensive to commit to blind.
+
+User pushback, correctly: switching from step-based to epoch-based
+accounting does not address this -- an epoch here is ~152 steps
+(dev-clean, batch 64 x 2s), just a different unit, not a different
+convergence rate. Rejected as a non-fix.
+
+**Working hypothesis, next thing to actually test (not yet run):**
+`--grad-clip-norm 1.0` against observed pre-clip grad_norm of 3.7-39.5
+means most steps are clipped 10-40x. This is far more aggressive relative
+scaling than in the single-clip diagnostics (where the task -- memorizing
+one clip -- tolerates heavy clipping fine). On diverse real batches this
+may be throttling effective step size well below what `--lr 1e-4` alone
+would suggest. Proposed short (800-step, ~25-40 min) A/B before committing
+to another multi-hour run:
+
+```
+uv run python scripts/train_stage1.py --resume outputs/stage1_best.pt --steps 800 --grad-clip-norm 5.0 --lr-scheduler none
+uv run python scripts/train_stage1.py --resume outputs/stage1_best.pt --steps 800 --lr 3e-4 --lr-scheduler none
+```
+
+Compare the loss-vs-step slope of each against the -0.00015/step baseline
+above. A meaningfully steeper slope confirms the clip/LR-throttling
+hypothesis; a similarly flat slope rules it out and points elsewhere (loss
+term weighting -- wav ~0.04 vs mel ~1.2 vs stft ~1.47, dominated by
+mel/stft which are barely moving -- or data-level issues).

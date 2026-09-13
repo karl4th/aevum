@@ -22,6 +22,7 @@ class LibriSpeechSegments(Dataset):
         segment_seconds: float = 2.0,
         download: bool = True,
     ) -> None:
+        Path(root).mkdir(parents=True, exist_ok=True)
         self.dataset = torchaudio.datasets.LIBRISPEECH(root=str(root), url=url, download=download)
         self.segment_samples = int(segment_seconds * TARGET_SAMPLE_RATE)
         self.resample = torchaudio.transforms.Resample(LIBRISPEECH_SAMPLE_RATE, TARGET_SAMPLE_RATE)
