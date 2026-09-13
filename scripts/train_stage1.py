@@ -37,6 +37,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segment-seconds", type=float, default=2.0)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=["none", "plateau", "cosine"],
+        default="plateau",
+        help="'plateau' (default): cut LR when val loss stalls/regresses -- reactive, doesn't need --steps guessed "
+        "correctly in advance. 'cosine': smooth decay from --lr to --lr-min over the full --steps run.",
+    )
+    parser.add_argument("--lr-factor", type=float, default=0.5, help="plateau: multiply LR by this when triggered")
+    parser.add_argument(
+        "--lr-patience",
+        type=int,
+        default=3,
+        help="plateau: number of val checks (every --sample-every steps) with no improvement before cutting LR",
+    )
+    parser.add_argument("--lr-min", type=float, default=1e-6, help="floor for both 'plateau' and 'cosine'")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--steps", type=int, default=20_000)
     parser.add_argument("--log-every", type=int, default=50)
@@ -70,6 +85,21 @@ def main() -> None:
     criterion = ReconstructionLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    scheduler = None
+    if args.lr_scheduler == "plateau":
+        # Reacts to val loss stalling/regressing (exactly the symptom that
+        # motivated this: docs/reports/stage1_v0.md, real-LibriSpeech run --
+        # loss oscillating in a band without net progress, val loss ticking
+        # up between checks). Cuts LR instead of raising it: the oscillation
+        # pattern (bouncing, not a slow monotonic crawl) indicates the LR is
+        # too large for the local loss landscape once early coarse progress
+        # is exhausted, not too small.
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=args.lr_factor, patience=args.lr_patience, min_lr=args.lr_min
+        )
+    elif args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr_min)
+
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     samples_dir = checkpoint_dir / "samples"
@@ -101,7 +131,10 @@ def main() -> None:
             optimizer.zero_grad()
             losses["total"].backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+            current_lr = optimizer.param_groups[0]["lr"]  # the LR actually used for this step's update, before any scheduler advance
             optimizer.step()
+            if args.lr_scheduler == "cosine":
+                scheduler.step()
 
             audio_seconds_seen += waveform.shape[0] * args.segment_seconds
 
@@ -116,6 +149,7 @@ def main() -> None:
                     "step": step,
                     "elapsed_sec": elapsed,
                     "audio_seconds_seen": audio_seconds_seen,
+                    "lr": current_lr,
                     "total_loss": losses["total"].item(),
                     "wav_loss": losses["wav"].item(),
                     "mel_loss": losses["mel"].item(),
@@ -132,7 +166,7 @@ def main() -> None:
                     f"wav {losses['wav'].item():.4f}  mel {losses['mel'].item():.4f}  "
                     f"stft {losses['stft'].item():.4f}  grad_norm {grad_norm.item():.3f}  "
                     f"gates(f/m/s) {gates['fast']:.3f}/{gates['mid']:.3f}/{gates['slow']:.3f}  "
-                    f"elapsed {elapsed:.0f}s"
+                    f"lr {current_lr:.2e}  elapsed {elapsed:.0f}s"
                 )
 
             if step % args.sample_every == 0:
@@ -143,9 +177,23 @@ def main() -> None:
                 model.train()
 
                 torchaudio.save(str(samples_dir / f"val_step{step}.wav"), val_recon[0].cpu(), 24_000)
-                val_log.append({"step": step, "val_loss": val_loss, "best_val_loss": min(best_val_loss, val_loss)})
+                val_log.append(
+                    {
+                        "step": step,
+                        "val_loss": val_loss,
+                        "best_val_loss": min(best_val_loss, val_loss),
+                        "lr": optimizer.param_groups[0]["lr"],
+                    }
+                )
                 write_log()
                 print(f"  [val] step {step:>7d}  loss {val_loss:.4f}  (best {best_val_loss:.4f})")
+
+                if args.lr_scheduler == "plateau":
+                    lr_before = optimizer.param_groups[0]["lr"]
+                    scheduler.step(val_loss)
+                    lr_after = optimizer.param_groups[0]["lr"]
+                    if lr_after < lr_before:
+                        print(f"  [lr] val loss stalled for {args.lr_patience} checks -- cutting lr {lr_before:.2e} -> {lr_after:.2e}")
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
