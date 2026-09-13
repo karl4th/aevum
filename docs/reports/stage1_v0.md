@@ -2391,3 +2391,39 @@ above. A meaningfully steeper slope confirms the clip/LR-throttling
 hypothesis; a similarly flat slope rules it out and points elsewhere (loss
 term weighting -- wav ~0.04 vs mel ~1.2 vs stft ~1.47, dominated by
 mel/stft which are barely moving -- or data-level issues).
+
+### A/B result: LR was the bottleneck, not grad-clip-norm
+
+Two short (800-step, fresh init, no `--resume`) diagnostic runs, both
+starting from the same random init (hence step-0 total loss ~4.45 in
+both, not comparable to the earlier resumed-checkpoint run):
+
+- **A**: `--grad-clip-norm 5.0 --lr-scheduler none` (lr default 1e-4)
+- **B**: `--lr 3e-4 --lr-scheduler none` (clip-norm default 1.0)
+
+Plateau region, steps 600-750 (mean of the 4 logged points):
+
+| | A (clip=5.0, lr=1e-4) | B (clip=1.0, lr=3e-4) |
+|---|---|---|
+| mean total loss | 2.731 | **2.672** |
+| grad_norm (pre-clip), late steps | 5-16 | **0.9-2** |
+| val@500 | 3.5079 | 3.4798 |
+
+**Conclusion:** loosening grad-clip-norm (A) reached roughly the same
+plateau band as the original resumed lr=1e-4/clip=1.0 baseline (~2.7-2.8)
+regardless of starting point -- clip-norm is not the bottleneck. Raising
+LR to 3e-4 (B) reached a lower, and notably *calmer* plateau: late-run
+pre-clip grad_norm dropped to 0.9-2, an order of magnitude below every
+other configuration tested in this investigation on real data (3-40
+everywhere else). This contradicts the assistant's prior prediction that
+a higher LR would worsen oscillation -- it did the opposite, suggesting
+lr=1e-4 was actually too small to move past the coarse-fit plateau, not
+too large.
+
+**Decision:** proceed with `--lr 3e-4`, default `--grad-clip-norm 1.0`,
+default `--lr-scheduler plateau`, resumed from `outputs/stage1_best.pt`,
+for the next full-length run:
+
+```
+uv run python scripts/train_stage1.py --resume outputs/stage1_best.pt --lr 3e-4 --steps 5000
+```
