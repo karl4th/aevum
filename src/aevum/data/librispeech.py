@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import tarfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -34,6 +35,7 @@ def _ensure_downloaded_and_extracted(root: Path, url: str, download: bool) -> No
     long enough over a Drive-mounted destination to look identical to a hang.
     """
     if (root / "LibriSpeech" / url).is_dir():
+        print(f"found existing '{url}' split under {root}, skipping download/extract", flush=True)
         return
     if not download:
         raise RuntimeError(f"Dataset split '{url}' not found under {root} and download=False.")
@@ -74,17 +76,28 @@ class LibriSpeechSegments(Dataset):
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
         _ensure_downloaded_and_extracted(root, url, download)
+
+        # torchaudio.datasets.LIBRISPEECH.__init__ does a blocking Path.glob() over
+        # every audio file to build its file list, with no progress callback -- on a
+        # Drive-mounted root each directory listing has real network latency, and
+        # with ~28.5k files (train-clean-100) this can silently take a while.
+        print(f"scanning '{url}' file list under {root} ...", flush=True)
+        t0 = time.perf_counter()
         self.dataset = torchaudio.datasets.LIBRISPEECH(root=str(root), url=url, download=False)
+        print(f"found {len(self.dataset)} files in {time.perf_counter() - t0:.0f}s", flush=True)
+
         self.segment_samples = int(segment_seconds * TARGET_SAMPLE_RATE)
         self._native_segment_samples = int(segment_seconds * LIBRISPEECH_SAMPLE_RATE)
         self.resample = torchaudio.transforms.Resample(LIBRISPEECH_SAMPLE_RATE, TARGET_SAMPLE_RATE)
 
         index_path = root / f"segment_index_{url}_{segment_seconds}s.json"
         if index_path.exists():
+            print(f"loading cached segment index from {index_path}", flush=True)
             self._index: list[tuple[int, int]] = [tuple(pair) for pair in json.loads(index_path.read_text())]
         else:
             self._index = self._build_index()
             index_path.write_text(json.dumps(self._index))
+        print(f"{len(self._index)} segments ready", flush=True)
 
     def _build_index(self) -> list[tuple[int, int]]:
         # torchaudio.info() reads only the file header (fast, no waveform decode).
