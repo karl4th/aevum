@@ -2494,3 +2494,40 @@ listening checkpoint in this report was on single-clip overfit runs; this
 is the first real-diverse-data checkpoint worth a subjective listening
 check, and will determine whether Stage 1 is ready to be called validated
 (ready to move toward VQ/predictor/event gate) or needs more training.
+
+## Fix: one epoch wasn't actually covering the whole corpus
+
+User caught this directly: `LibriSpeechSegments` (`src/aevum/data/librispeech.py`)
+had `__len__` return the *utterance count*, and `__getitem__` drew one random
+`segment_seconds` crop per utterance regardless of the utterance's own
+length. So one "epoch" only touched `num_utterances * segment_seconds`
+seconds of audio -- for `train-clean-100` (28,539 files, 100.6h), that's
+28,539*2s = 15.85h, **~16% of the split**, not the "100 hours" an epoch is
+supposed to mean. This also means every earlier chat-side `steps_per_epoch`
+estimate in this report (computed from total corpus duration /
+(batch*segment_seconds)) was wrong by roughly the same ~6x factor -- the
+100-epoch run logged as "epochs" in this report actually completed only
+~11k true gradient steps' worth of the intended full-corpus coverage, not
+the ~70k implied by the duration-based math used to pick `--epochs`.
+
+**Fix:** rewrote `LibriSpeechSegments` to build a flat index of
+non-overlapping `segment_seconds` chunks across every utterance (using
+`torchaudio.info()` for header-only duration reads, no full decode),
+cached to `<data-root>/segment_index_<url>_<segment_seconds>s.json` so it
+isn't rebuilt every run. `__len__` now returns the true segment count, and
+`__getitem__` loads only the needed slice via `torchaudio.load(...,
+frame_offset=..., num_frames=...)` (more efficient than the old
+whole-file-then-crop approach too). One epoch now genuinely means one pass
+over the entire split. Verified against a small synthetic LibriSpeech-shaped
+fixture (5.3s file -> 2 segments as expected, 0.7s file -> 1 padded segment)
+before relying on it against the real corpus.
+
+Practical effect: `steps_per_epoch` will jump roughly 6x versus the old
+scheme (train-clean-100 goes from ~111 steps/epoch at batch=256 to
+something close to the true duration-based estimate, ~700+, printed
+exactly in the run's `config` block). `--epochs` values used so far in
+this report should be recomputed downward accordingly for an equivalent
+step budget. First run against a fresh `--data-root` will also be slower
+to start than before -- building the index means one `torchaudio.info()`
+call per file (28,539 for train-clean-100), cached to disk afterward so
+subsequent runs skip it.

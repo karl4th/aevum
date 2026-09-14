@@ -1,7 +1,15 @@
-"""LibriSpeech, resampled to the codec's target rate and cropped/padded to fixed-length segments."""
+"""LibriSpeech, resampled to the codec's target rate and chopped into fixed-length segments.
+
+One epoch covers the whole split: every utterance is chopped into
+non-overlapping ``segment_seconds``-long chunks, not sampled once at random.
+The old scheme (one random crop per *file*, regardless of length) meant an
+"epoch" only ever touched ~16% of a split's total audio (e.g. ~15.9h of
+train-clean-100's 100.6h) -- see docs/reports/stage1_v0.md.
+"""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import torch
@@ -13,7 +21,16 @@ LIBRISPEECH_SAMPLE_RATE = 16_000
 
 
 class LibriSpeechSegments(Dataset):
-    """Fixed-length mono 24 kHz speech segments drawn from a LibriSpeech split."""
+    """Fixed-length mono 24 kHz speech segments covering the full LibriSpeech split.
+
+    Every utterance is chopped into non-overlapping ``segment_seconds``-long
+    chunks (utterances shorter than one segment are kept as a single
+    zero-padded chunk; a shorter tail chunk at the end of a longer utterance
+    is dropped). The flat segment index is built once via ``torchaudio.info``
+    (header-only reads, no full decode) and cached to
+    ``<root>/segment_index_<url>_<segment_seconds>s.json`` so it isn't
+    rebuilt on every run.
+    """
 
     def __init__(
         self,
@@ -22,26 +39,51 @@ class LibriSpeechSegments(Dataset):
         segment_seconds: float = 2.0,
         download: bool = True,
     ) -> None:
-        Path(root).mkdir(parents=True, exist_ok=True)
+        root = Path(root)
+        root.mkdir(parents=True, exist_ok=True)
         self.dataset = torchaudio.datasets.LIBRISPEECH(root=str(root), url=url, download=download)
         self.segment_samples = int(segment_seconds * TARGET_SAMPLE_RATE)
+        self._native_segment_samples = int(segment_seconds * LIBRISPEECH_SAMPLE_RATE)
         self.resample = torchaudio.transforms.Resample(LIBRISPEECH_SAMPLE_RATE, TARGET_SAMPLE_RATE)
 
+        index_path = root / f"segment_index_{url}_{segment_seconds}s.json"
+        if index_path.exists():
+            self._index: list[tuple[int, int]] = [tuple(pair) for pair in json.loads(index_path.read_text())]
+        else:
+            self._index = self._build_index()
+            index_path.write_text(json.dumps(self._index))
+
+    def _build_index(self) -> list[tuple[int, int]]:
+        # torchaudio.info() reads only the file header (fast, no waveform decode).
+        # self.dataset._archive/get_metadata are torchaudio-internal but this is
+        # the only way to get per-file paths/durations without loading audio.
+        archive = Path(self.dataset._archive)
+        index: list[tuple[int, int]] = []
+        for utterance_idx in range(len(self.dataset)):
+            filepath, *_ = self.dataset.get_metadata(utterance_idx)
+            num_frames = torchaudio.info(str(archive / filepath)).num_frames
+            n_segments = max(1, num_frames // self._native_segment_samples)
+            index.extend((utterance_idx, seg * self._native_segment_samples) for seg in range(n_segments))
+        return index
+
     def __len__(self) -> int:
-        return len(self.dataset)
+        return len(self._index)
 
     def __getitem__(self, index: int) -> torch.Tensor:
-        waveform, sample_rate, *_ = self.dataset[index]
+        utterance_idx, start = self._index[index]
+        filepath, sample_rate, *_ = self.dataset.get_metadata(utterance_idx)
         if sample_rate != LIBRISPEECH_SAMPLE_RATE:
             raise ValueError(f"expected {LIBRISPEECH_SAMPLE_RATE} Hz source audio, got {sample_rate}")
 
+        archive = Path(self.dataset._archive)
+        waveform, _ = torchaudio.load(
+            str(archive / filepath), frame_offset=start, num_frames=self._native_segment_samples
+        )
         waveform = self.resample(waveform)  # [1, samples] at 24 kHz
-        num_samples = waveform.shape[-1]
 
-        if num_samples >= self.segment_samples:
-            start = torch.randint(0, num_samples - self.segment_samples + 1, (1,)).item()
-            waveform = waveform[:, start : start + self.segment_samples]
+        if waveform.shape[-1] < self.segment_samples:
+            waveform = torch.nn.functional.pad(waveform, (0, self.segment_samples - waveform.shape[-1]))
         else:
-            waveform = torch.nn.functional.pad(waveform, (0, self.segment_samples - num_samples))
+            waveform = waveform[:, : self.segment_samples]
 
         return waveform
