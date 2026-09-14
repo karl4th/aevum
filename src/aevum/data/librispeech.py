@@ -5,53 +5,87 @@ non-overlapping ``segment_seconds``-long chunks, not sampled once at random.
 The old scheme (one random crop per *file*, regardless of length) meant an
 "epoch" only ever touched ~16% of a split's total audio (e.g. ~15.9h of
 train-clean-100's 100.6h) -- see docs/reports/stage1_v0.md.
+
+All progress reporting here uses plain ``print(..., flush=True)`` lines, not
+``tqdm``: tqdm's in-place (carriage-return) redraw did not render at all
+through ``!uv run ...`` in Colab, while plain flushed prints reliably did --
+see docs/reports/stage1_v0.md.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tarfile
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
 import torchaudio
 from torch.utils.data import Dataset
-from tqdm import tqdm
 
 TARGET_SAMPLE_RATE = 24_000
 LIBRISPEECH_SAMPLE_RATE = 16_000
 _OPENSLR_BASE_URL = "http://www.openslr.org/resources/12/"
+_PROGRESS_EVERY_BYTES = 200 * 1024 * 1024  # print every ~200MB downloaded
+_PROGRESS_EVERY_FILES = 1000  # print every N files extracted/indexed
+
+
+def _download_with_progress(url: str, dst: Path, hash_prefix: str | None) -> None:
+    tmp = dst.with_name(dst.name + ".partial")
+    sha256 = hashlib.sha256()
+    with urllib.request.urlopen(url) as response, open(tmp, "wb") as f:
+        total = int(response.headers.get("Content-Length", 0))
+        downloaded = 0
+        next_print = 0
+        print(f"downloading {url} ({total / 1e9:.2f} GB)", flush=True)
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            sha256.update(chunk)
+            downloaded += len(chunk)
+            if downloaded >= next_print:
+                pct = downloaded / total * 100 if total else 0.0
+                print(f"  downloaded {downloaded / 1e9:.2f}/{total / 1e9:.2f} GB ({pct:.1f}%)", flush=True)
+                next_print += _PROGRESS_EVERY_BYTES
+
+    if hash_prefix and not sha256.hexdigest().startswith(hash_prefix):
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"checksum mismatch downloading {url}")
+    tmp.rename(dst)
+    print(f"download complete: {dst}", flush=True)
 
 
 def _ensure_downloaded_and_extracted(root: Path, url: str, download: bool) -> None:
-    """Fetch+extract a LibriSpeech split with visible progress.
-
-    Replaces relying on ``torchaudio.datasets.LIBRISPEECH(..., download=True)``:
-    its download step does show a progress percentage (via ``torch.hub``'s
-    downloader, reused here), but its extraction step (``tarfile`` member-by-member,
-    no callback) prints nothing at all -- for train-clean-100 that's ~28.5k files,
-    long enough over a Drive-mounted destination to look identical to a hang.
-    """
+    """Fetch+extract a LibriSpeech split with visible progress (plain prints, see module docstring)."""
     if (root / "LibriSpeech" / url).is_dir():
         print(f"found existing '{url}' split under {root}, skipping download/extract", flush=True)
         return
     if not download:
         raise RuntimeError(f"Dataset split '{url}' not found under {root} and download=False.")
 
-    from torchaudio._internal import download_url_to_file
     from torchaudio.datasets.librispeech import _CHECKSUMS
 
     archive = root / f"{url}.tar.gz"
     download_url = _OPENSLR_BASE_URL + f"{url}.tar.gz"
     if not archive.is_file():
-        download_url_to_file(download_url, str(archive), hash_prefix=_CHECKSUMS.get(download_url))
+        _download_with_progress(download_url, archive, _CHECKSUMS.get(download_url))
+    else:
+        print(f"found existing archive {archive}, skipping download", flush=True)
 
+    print(f"extracting {archive} ...", flush=True)
     with tarfile.open(archive, "r") as tar:
         members = tar.getmembers()
-        for member in tqdm(members, desc=f"extracting {url}", unit="file"):
+        total = len(members)
+        print(f"  {total} files to extract", flush=True)
+        for i, member in enumerate(members, 1):
             tar.extract(member, root)
+            if i % _PROGRESS_EVERY_FILES == 0 or i == total:
+                print(f"  extracted {i}/{total} files", flush=True)
 
 
 class LibriSpeechSegments(Dataset):
@@ -104,24 +138,21 @@ class LibriSpeechSegments(Dataset):
         # self.dataset._archive/get_metadata are torchaudio-internal but this is
         # the only way to get per-file paths/durations without loading audio.
         # Parallelized with threads (I/O-bound, especially over a Drive-mounted
-        # --data-root where each file access has real network latency) and
-        # shown with a progress bar -- without both, this step looks identical
-        # to a hang for the ~1-2 minutes (local disk) to much longer (network
-        # mount) it can take on a fresh --data-root.
+        # --data-root where each file access has real network latency).
         archive = Path(self.dataset._archive)
+        total = len(self.dataset)
+        print(f"indexing {total} files ...", flush=True)
 
         def _num_frames(utterance_idx: int) -> int:
             filepath, *_ = self.dataset.get_metadata(utterance_idx)
             return torchaudio.info(str(archive / filepath)).num_frames
 
+        frame_counts: list[int] = []
         with ThreadPoolExecutor(max_workers=32) as pool:
-            frame_counts = list(
-                tqdm(
-                    pool.map(_num_frames, range(len(self.dataset))),
-                    total=len(self.dataset),
-                    desc="indexing LibriSpeech segments",
-                )
-            )
+            for i, num_frames in enumerate(pool.map(_num_frames, range(total)), 1):
+                frame_counts.append(num_frames)
+                if i % _PROGRESS_EVERY_FILES == 0 or i == total:
+                    print(f"  indexed {i}/{total} files", flush=True)
 
         index: list[tuple[int, int]] = []
         for utterance_idx, num_frames in enumerate(frame_counts):
