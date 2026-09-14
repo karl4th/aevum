@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    print(f"starting run: device={device} data_root={args.data_root} url={args.librispeech_url}", flush=True)
 
     dataset = LibriSpeechSegments(
         root=args.data_root, url=args.librispeech_url, segment_seconds=args.segment_seconds
@@ -93,7 +94,7 @@ def main() -> None:
     model = DenseContinuousAutoencoder().to(device)
     if args.resume:
         model.load_state_dict(torch.load(args.resume, map_location=device))
-        print(f"resumed model weights from {args.resume}")
+        print(f"resumed model weights from {args.resume}", flush=True)
     criterion = ReconstructionLoss(
         wav_weight=args.wav_weight, mel_weight=args.mel_weight, stft_weight=args.stft_weight
     ).to(device)
@@ -180,7 +181,10 @@ def main() -> None:
             scheduler.step(val_loss)
             lr_after = optimizer.param_groups[0]["lr"]
             if lr_after < lr_before:
-                print(f"  [lr] val loss stalled for {args.lr_patience} epochs -- cutting lr {lr_before:.2e} -> {lr_after:.2e}")
+                print(
+                    f"  [lr] val loss stalled for {args.lr_patience} epochs -- cutting lr {lr_before:.2e} -> {lr_after:.2e}",
+                    flush=True,
+                )
 
         is_best = val_loss < best_val_loss
         if is_best:
@@ -210,7 +214,8 @@ def main() -> None:
             f"epoch {epoch:>4d}  total {mean['total']:.4f}  wav {mean['wav']:.4f}  "
             f"mel {mean['mel']:.4f}  stft {mean['stft']:.4f}  grad_norm {mean['grad_norm']:.3f}  "
             f"gates(f/m/s) {gates['fast']:.3f}/{gates['mid']:.3f}/{gates['slow']:.3f}  lr {current_lr:.2e}  "
-            f"val {val_loss:.4f} (best {best_val_loss:.4f}){'  *' if is_best else ''}  elapsed {elapsed:.0f}s"
+            f"val {val_loss:.4f} (best {best_val_loss:.4f}){'  *' if is_best else ''}  elapsed {elapsed:.0f}s",
+            flush=True,
         )
 
         if (epoch + 1) % args.checkpoint_every_epochs == 0:
@@ -218,7 +223,7 @@ def main() -> None:
 
     torch.save(model.state_dict(), checkpoint_dir / "stage1_final.pt")
     write_log()
-    print(f"\ntrain log written to: {log_path}")
+    print(f"\ntrain log written to: {log_path}", flush=True)
 
 
 if __name__ == "__main__":
