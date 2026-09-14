@@ -10,6 +10,7 @@ train-clean-100's 100.6h) -- see docs/reports/stage1_v0.md.
 from __future__ import annotations
 
 import json
+import tarfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -20,6 +21,35 @@ from tqdm import tqdm
 
 TARGET_SAMPLE_RATE = 24_000
 LIBRISPEECH_SAMPLE_RATE = 16_000
+_OPENSLR_BASE_URL = "http://www.openslr.org/resources/12/"
+
+
+def _ensure_downloaded_and_extracted(root: Path, url: str, download: bool) -> None:
+    """Fetch+extract a LibriSpeech split with visible progress.
+
+    Replaces relying on ``torchaudio.datasets.LIBRISPEECH(..., download=True)``:
+    its download step does show a progress percentage (via ``torch.hub``'s
+    downloader, reused here), but its extraction step (``tarfile`` member-by-member,
+    no callback) prints nothing at all -- for train-clean-100 that's ~28.5k files,
+    long enough over a Drive-mounted destination to look identical to a hang.
+    """
+    if (root / "LibriSpeech" / url).is_dir():
+        return
+    if not download:
+        raise RuntimeError(f"Dataset split '{url}' not found under {root} and download=False.")
+
+    from torchaudio._internal import download_url_to_file
+    from torchaudio.datasets.librispeech import _CHECKSUMS
+
+    archive = root / f"{url}.tar.gz"
+    download_url = _OPENSLR_BASE_URL + f"{url}.tar.gz"
+    if not archive.is_file():
+        download_url_to_file(download_url, str(archive), hash_prefix=_CHECKSUMS.get(download_url))
+
+    with tarfile.open(archive, "r") as tar:
+        members = tar.getmembers()
+        for member in tqdm(members, desc=f"extracting {url}", unit="file"):
+            tar.extract(member, root)
 
 
 class LibriSpeechSegments(Dataset):
@@ -43,7 +73,8 @@ class LibriSpeechSegments(Dataset):
     ) -> None:
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
-        self.dataset = torchaudio.datasets.LIBRISPEECH(root=str(root), url=url, download=download)
+        _ensure_downloaded_and_extracted(root, url, download)
+        self.dataset = torchaudio.datasets.LIBRISPEECH(root=str(root), url=url, download=False)
         self.segment_samples = int(segment_seconds * TARGET_SAMPLE_RATE)
         self._native_segment_samples = int(segment_seconds * LIBRISPEECH_SAMPLE_RATE)
         self.resample = torchaudio.transforms.Resample(LIBRISPEECH_SAMPLE_RATE, TARGET_SAMPLE_RATE)
