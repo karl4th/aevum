@@ -10,11 +10,13 @@ train-clean-100's 100.6h) -- see docs/reports/stage1_v0.md.
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
 import torchaudio
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 TARGET_SAMPLE_RATE = 24_000
 LIBRISPEECH_SAMPLE_RATE = 16_000
@@ -57,11 +59,28 @@ class LibriSpeechSegments(Dataset):
         # torchaudio.info() reads only the file header (fast, no waveform decode).
         # self.dataset._archive/get_metadata are torchaudio-internal but this is
         # the only way to get per-file paths/durations without loading audio.
+        # Parallelized with threads (I/O-bound, especially over a Drive-mounted
+        # --data-root where each file access has real network latency) and
+        # shown with a progress bar -- without both, this step looks identical
+        # to a hang for the ~1-2 minutes (local disk) to much longer (network
+        # mount) it can take on a fresh --data-root.
         archive = Path(self.dataset._archive)
-        index: list[tuple[int, int]] = []
-        for utterance_idx in range(len(self.dataset)):
+
+        def _num_frames(utterance_idx: int) -> int:
             filepath, *_ = self.dataset.get_metadata(utterance_idx)
-            num_frames = torchaudio.info(str(archive / filepath)).num_frames
+            return torchaudio.info(str(archive / filepath)).num_frames
+
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            frame_counts = list(
+                tqdm(
+                    pool.map(_num_frames, range(len(self.dataset))),
+                    total=len(self.dataset),
+                    desc="indexing LibriSpeech segments",
+                )
+            )
+
+        index: list[tuple[int, int]] = []
+        for utterance_idx, num_frames in enumerate(frame_counts):
             n_segments = max(1, num_frames // self._native_segment_samples)
             index.extend((utterance_idx, seg * self._native_segment_samples) for seg in range(n_segments))
         return index
