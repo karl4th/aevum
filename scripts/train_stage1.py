@@ -24,13 +24,25 @@ as GPU tensors and only synced (`.item()`) at --log-every cadence instead
 of every single batch, since a CPU-GPU sync every step serializes exactly
 the launch-bound loop this is trying to speed up; TF32 matmul + cudnn
 autotune are enabled; the optimizer uses the fused CUDA AdamW kernel; the
-DataLoader uses pinned memory and persistent workers. Opt-in, higher-payoff
-but numerically-sensitive: --compile (torch.compile, mode='reduce-overhead',
-uses CUDA graphs internally -- attacks the launch-overhead bottleneck
-directly) and --amp (bf16 autocast on forward+loss, big matmul speedup on
-A100 tensor cores, no GradScaler needed since bf16's exponent range matches
-fp32). Verify a short run's loss trajectory against an unflagged run before
-trusting a long one with either flag on.
+DataLoader uses pinned memory and persistent workers.
+
+--compile and --amp exist as opt-in flags but neither has actually helped
+on Stage 1's shape (encoder/decoder: 200+200 sequential steps of small
+192-384-dim ops) -- both target compute throughput, and this loop isn't
+compute bound:
+- --compile (mode='reduce-overhead', CUDA graphs): dynamo fully unrolls
+  the Python for-loop into one huge graph before it can capture anything,
+  so first-call compilation can hang for a very long time (observed: still
+  compiling after 10+ minutes). Would need per-step compilation
+  (compiling encoder.step/decoder.step individually, called from the
+  Python loop) to be worth trying again -- not implemented.
+- --amp (bf16 autocast): measured SLOWER end-to-end. Autocast inserts
+  fp32<->bf16 cast kernels around each eligible op, which adds kernel
+  launches in a loop that was already launch-overhead bound instead of
+  compute bound -- the ops are too small for bf16 tensor-core throughput
+  to matter, so this is pure added overhead. (Also: torch.stft, used by
+  the mel/STFT loss terms, goes through cuFFT and does not support bf16
+  at all -- the loss is computed in fp32 regardless of --amp.)
 
 Usage:
     uv run scripts/train_stage1.py --data-root data/raw --librispeech-url dev-clean --epochs 50
@@ -104,8 +116,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--amp",
         action="store_true",
-        help="bf16 autocast on forward+loss (no GradScaler needed). Opt-in: verify a short run's "
-        "loss trajectory before trusting a long one.",
+        help="bf16 autocast on forward+loss. Measured SLOWER on Stage 1 (docs/reports/stage1_v0.md): "
+        "the encoder/decoder loop is launch-overhead bound with small (192-384-dim) ops, so autocast's "
+        "per-op fp32<->bf16 cast kernels add launches rather than speeding up compute that was never "
+        "the bottleneck. Not recommended for this model shape; kept for future stages with bigger ops.",
     )
     return parser.parse_args()
 
