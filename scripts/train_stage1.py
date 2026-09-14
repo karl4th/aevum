@@ -9,9 +9,12 @@ fixed-gate skip.
 
 Trains epoch-by-epoch (one full pass over the dataset per epoch) rather than
 by raw step count -- per-step loss on diverse real batches is too noisy to
-read directly, per-epoch mean loss is not. Each epoch shows a tqdm progress
-bar and ends with one logged summary line (train means + val loss), appended
-to a JSON log file (default outputs/train_log.json) as well as printed.
+read directly, per-epoch mean loss is not. Each epoch prints periodic
+in-progress batch lines (plain prints, not tqdm -- tqdm's carriage-return
+redraw does not render through `!uv run ...` in Colab, see
+docs/reports/stage1_v0.md) and ends with one logged summary line (train
+means + val loss), appended to a JSON log file (default
+outputs/train_log.json) as well as printed.
 
 Usage:
     uv run scripts/train_stage1.py --data-root data/raw --librispeech-url dev-clean --epochs 50
@@ -25,7 +28,6 @@ from pathlib import Path
 import torch
 import torchaudio
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from aevum.data.librispeech import LibriSpeechSegments
 from aevum.models.autoencoder import DenseContinuousAutoencoder
@@ -67,6 +69,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mel-weight", type=float, default=1.0)
     parser.add_argument("--stft-weight", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--log-every", type=int, default=20, help="print an in-progress line every N batches within an epoch"
+    )
     parser.add_argument("--checkpoint-every-epochs", type=int, default=1)
     parser.add_argument("--checkpoint-dir", type=str, default="outputs")
     parser.add_argument("--log-file", type=str, default=None, help="JSON log path, default <checkpoint-dir>/train_log.json")
@@ -137,8 +142,8 @@ def main() -> None:
     for epoch in range(args.epochs):
         model.train()
         running = {"total": 0.0, "wav": 0.0, "mel": 0.0, "stft": 0.0, "grad_norm": 0.0}
-        progress = tqdm(loader, desc=f"epoch {epoch:>4d}", unit="batch")
-        for waveform in progress:
+        epoch_start = time.perf_counter()
+        for batch_idx, waveform in enumerate(loader, 1):
             waveform = waveform.to(device)
 
             reconstructed = model(waveform)
@@ -158,7 +163,14 @@ def main() -> None:
             running["mel"] += losses["mel"].item()
             running["stft"] += losses["stft"].item()
             running["grad_norm"] += grad_norm.item()
-            progress.set_postfix(loss=f"{losses['total'].item():.3f}", lr=f"{current_lr:.1e}")
+
+            if batch_idx % args.log_every == 0 or batch_idx == steps_per_epoch:
+                batch_elapsed = time.perf_counter() - epoch_start
+                print(
+                    f"  epoch {epoch:>4d} batch {batch_idx:>4d}/{steps_per_epoch}  "
+                    f"loss {losses['total'].item():.4f}  lr {current_lr:.2e}  {batch_elapsed:.0f}s",
+                    flush=True,
+                )
 
         mean = {k: v / steps_per_epoch for k, v in running.items()}
         elapsed = time.perf_counter() - start_time
