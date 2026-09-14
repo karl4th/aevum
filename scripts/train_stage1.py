@@ -212,7 +212,11 @@ def main() -> None:
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.amp):
                 reconstructed = model(waveform)
-                losses = criterion(waveform, reconstructed)
+            # Loss is always computed in fp32, outside autocast: torch.stft (used by both the
+            # mel and multi-res STFT terms) goes through cuFFT, which does not support bf16 at
+            # all and errors instead of upcasting -- autocast doesn't cover this op, so a bf16
+            # `reconstructed` has to be cast back explicitly rather than left to autocast.
+            losses = criterion(waveform, reconstructed.float())
 
             optimizer.zero_grad(set_to_none=True)
             losses["total"].backward()
@@ -249,7 +253,7 @@ def main() -> None:
         model.eval()
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.amp):
             val_recon = model(val_waveform)
-            val_loss = criterion(val_waveform, val_recon)["total"].item()
+        val_loss = criterion(val_waveform, val_recon.float())["total"].item()
 
         torchaudio.save(str(samples_dir / f"val_epoch{epoch}.wav"), val_recon[0].float().cpu(), 24_000)
 
