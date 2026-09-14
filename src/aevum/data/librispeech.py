@@ -29,29 +29,42 @@ from torch.utils.data import Dataset
 TARGET_SAMPLE_RATE = 24_000
 LIBRISPEECH_SAMPLE_RATE = 16_000
 _OPENSLR_BASE_URL = "http://www.openslr.org/resources/12/"
-_PROGRESS_EVERY_BYTES = 200 * 1024 * 1024  # print every ~200MB downloaded
+_PROGRESS_EVERY_BYTES = 10 * 1024 * 1024  # print every ~10MB downloaded
 _PROGRESS_EVERY_FILES = 1000  # print every N files extracted/indexed
+_SOCKET_TIMEOUT_SECONDS = 30  # a stalled connection raises instead of hanging silently forever
+_DOWNLOAD_ATTEMPTS = 5
 
 
 def _download_with_progress(url: str, dst: Path, hash_prefix: str | None) -> None:
     tmp = dst.with_name(dst.name + ".partial")
-    sha256 = hashlib.sha256()
-    with urllib.request.urlopen(url) as response, open(tmp, "wb") as f:
-        total = int(response.headers.get("Content-Length", 0))
-        downloaded = 0
-        next_print = 0
-        print(f"downloading {url} ({total / 1e9:.2f} GB)", flush=True)
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
-            sha256.update(chunk)
-            downloaded += len(chunk)
-            if downloaded >= next_print:
-                pct = downloaded / total * 100 if total else 0.0
-                print(f"  downloaded {downloaded / 1e9:.2f}/{total / 1e9:.2f} GB ({pct:.1f}%)", flush=True)
-                next_print += _PROGRESS_EVERY_BYTES
+
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        sha256 = hashlib.sha256()
+        try:
+            with urllib.request.urlopen(url, timeout=_SOCKET_TIMEOUT_SECONDS) as response, open(tmp, "wb") as f:
+                total = int(response.headers.get("Content-Length", 0))
+                downloaded = 0
+                next_print = 0
+                print(f"downloading {url} ({total / 1e9:.2f} GB) [attempt {attempt}/{_DOWNLOAD_ATTEMPTS}]", flush=True)
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    sha256.update(chunk)
+                    downloaded += len(chunk)
+                    if downloaded >= next_print:
+                        pct = downloaded / total * 100 if total else 0.0
+                        print(f"  downloaded {downloaded / 1e9:.3f}/{total / 1e9:.2f} GB ({pct:.1f}%)", flush=True)
+                        next_print += _PROGRESS_EVERY_BYTES
+            break
+        except (TimeoutError, OSError) as e:
+            print(f"  download stalled/failed on attempt {attempt}/{_DOWNLOAD_ATTEMPTS}: {e!r}", flush=True)
+            if attempt == _DOWNLOAD_ATTEMPTS:
+                raise
+            print("  retrying from scratch...", flush=True)
+    else:
+        raise RuntimeError(f"failed to download {url} after {_DOWNLOAD_ATTEMPTS} attempts")
 
     if hash_prefix and not sha256.hexdigest().startswith(hash_prefix):
         tmp.unlink(missing_ok=True)
