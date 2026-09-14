@@ -2427,3 +2427,70 @@ for the next full-length run:
 ```
 uv run python scripts/train_stage1.py --resume outputs/stage1_best.pt --lr 3e-4 --steps 5000
 ```
+
+## train-clean-100, batch=256, A100 (epoch-based script) -- best run yet
+
+Fresh start (no `--resume`) on `train-clean-100` (100h, vs `dev-clean`'s
+5.4h used in every earlier real-data run), `--batch-size 256` (vs 64
+before, sized for A100 instead of the RTX 3060 used locally), `--lr 3e-4`,
+`--epochs 100` via the new epoch-based `train_stage1.py` +
+`notebooks/train_stage1_colab.ipynb` (checkpoints/data on Google Drive).
+
+Through epoch 62: val loss 3.4232 (epoch 0) -> **1.6319** (epoch 62,
+new best), train total 4.1225 -> 1.5402, monotonic with no real
+instability (occasional grad_norm spikes to 30-40 on isolated batches,
+same benign pattern as every prior run -- loss doesn't react).
+
+**First real trigger of the `ReduceLROnPlateau` scheduler in this
+project:** val stalled at 1.6667-1.6954 for epochs 57-61 (4 epochs with no
+new best, patience=3), cutting lr 3e-4 -> 1.5e-4 at the end of epoch 61.
+Epoch 62 (first epoch trained at the new lr) immediately produced a new
+best (1.6319), clearly below the prior plateau band -- the scheduler
+mechanism (added speculatively after the very first real-data stall,
+months of runs ago, never actually exercised until now) worked exactly as
+designed the first time it got the chance to fire.
+
+Pace: ~250s/epoch on A100, so the full 100-epoch run is ~7h.
+
+Blocking issue hit and fixed along the way: an earlier interrupted run had
+left a partially-extracted `LibriSpeech/train-clean-100` directory on the
+Drive-backed `--data-root` -- torchaudio's dataset class sees the
+directory already exists and skips re-downloading/re-extracting, so it
+silently kept using the corrupt partial data until failing on a missing
+`.trans.txt` file deep in a DataLoader worker. Fix: `rm -rf` the
+`LibriSpeech` folder and any partial `.tar.gz` under `--data-root` and
+re-run from empty -- torchaudio doesn't verify/repair partial extractions
+on its own.
+
+### Run complete: 100/100 epochs, best result of the project
+
+Final numbers: val loss **1.5017** (best, epoch 99), train total 1.4206 --
+by a wide margin the best result in this project (prior best on
+dev-clean/batch=64 was val 1.7721).
+
+`ReduceLROnPlateau` fired twice in this run, both times with a clear
+immediate payoff:
+
+- epoch 61: 3e-4 -> 1.5e-4, epoch 62 (first epoch at new lr) produced a
+  new best (1.6319) clearly below the epoch 57-61 plateau band
+  (1.6667-1.6954).
+- epoch 94: 1.5e-4 -> 7.5e-5, epochs 96-99 kept improving steadily
+  (1.5113 -> 1.5037 -> 1.5118 -> 1.5017).
+
+This is the mechanism's first real validation in this project (added
+speculatively after the very first real-data stall, months of runs
+earlier, never actually exercised until this run) -- it triggered exactly
+when a genuine stall occurred, and both cuts were immediately followed by
+renewed progress rather than nothing happening, confirming the LR-too-high
+hypothesis behind the scheduler's design.
+
+Trend was still moving at epoch 99 (94->99 train: 1.4357 -> 1.4206), not a
+dead plateau -- more epochs from `stage1_final.pt` would likely continue
+improving.
+
+**Next step, not yet done:** listen to `outputs/samples/val_best.wav` and
+`val_epoch99.wav` on Drive. Every prior "does it sound like speech"
+listening checkpoint in this report was on single-clip overfit runs; this
+is the first real-diverse-data checkpoint worth a subjective listening
+check, and will determine whether Stage 1 is ready to be called validated
+(ready to move toward VQ/predictor/event gate) or needs more training.

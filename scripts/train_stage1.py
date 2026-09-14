@@ -55,6 +55,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lr-min", type=float, default=1e-6, help="floor for both 'plateau' and 'cosine'")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--wav-weight",
+        type=float,
+        default=1.0,
+        help="weight on the raw-waveform L1 term. Its natural magnitude (~0.04) is far smaller than "
+        "mel/stft (~0.5-0.8), so at the default 1.0 it barely contributes to the gradient and stays "
+        "essentially unoptimized on diverse real data (see docs/reports/stage1_v0.md) -- try 10-20 to "
+        "make its influence comparable to mel/stft.",
+    )
+    parser.add_argument("--mel-weight", type=float, default=1.0)
+    parser.add_argument("--stft-weight", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--checkpoint-every-epochs", type=int, default=1)
     parser.add_argument("--checkpoint-dir", type=str, default="outputs")
@@ -83,7 +94,9 @@ def main() -> None:
     if args.resume:
         model.load_state_dict(torch.load(args.resume, map_location=device))
         print(f"resumed model weights from {args.resume}")
-    criterion = ReconstructionLoss().to(device)
+    criterion = ReconstructionLoss(
+        wav_weight=args.wav_weight, mel_weight=args.mel_weight, stft_weight=args.stft_weight
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     scheduler = None
