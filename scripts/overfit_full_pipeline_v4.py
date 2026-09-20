@@ -107,16 +107,20 @@ def main() -> None:
     gates = {name: nn.Parameter(torch.tensor(args.gate_init, device=device)) for name in BRANCH_TAU_RANGES}
     w_x = identity_conv1d(dim, device)
 
-    decoder = ContinuousDecoder(event_dim=dim, output_dim=dim, candidate_uses_hidden=False).to(device)
-    w_skip_decoder = identity_conv1d(dim, device)
-    gate_decoder = torch.tensor(args.decoder_gate, device=device)  # fixed, not trained -- Run 26 gate-collapse finding
+    # skip_gate=args.decoder_gate: ContinuousDecoder already fuses temporal + skip_gate*skip
+    # internally (see decoder.py step()). Adding a second external skip on top of that -- as
+    # this script previously did via w_skip_decoder/gate_decoder -- double-counts the skip
+    # branch and no longer matches the production autoencoder's single-skip architecture.
+    decoder = ContinuousDecoder(
+        event_dim=dim, output_dim=dim, candidate_uses_hidden=False, skip_gate=args.decoder_gate
+    ).to(device)
 
     generator = CausalWaveformGenerator(input_dim=dim).to(device)
 
     num_frames = target.shape[-1] // generator.total_stride
     target = target[:, :, : num_frames * generator.total_stride]
 
-    modules = [frontend, w_x, decoder, w_skip_decoder, generator, *cells.values(), *projections.values()]
+    modules = [frontend, w_x, decoder, generator, *cells.values(), *projections.values()]
     params = [p for m in modules for p in m.parameters()] + list(gates.values())
     param_count = sum(p.numel() for p in params)
     print(f"gate_init={args.gate_init} decoder_gate(fixed)={args.decoder_gate} params={param_count:,}")
@@ -145,8 +149,8 @@ def main() -> None:
         for name in cells:
             z = z + gates[name] * projections[name](hidden[name])
 
-        y, _ = decoder(z.transpose(1, 2))  # [B, T, dim]
-        y_for_generator = y.transpose(1, 2) + gate_decoder * w_skip_decoder(z)  # [B, dim, T]
+        y, _ = decoder(z.transpose(1, 2))  # [B, T, dim], already includes the decoder's own fused skip
+        y_for_generator = y.transpose(1, 2)  # [B, dim, T]
 
         recon = generator(y_for_generator)
         loss_dict = criterion(target, recon)

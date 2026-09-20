@@ -84,11 +84,26 @@ class ContinuousDecoder(nn.Module):
             device,
         )
 
-    def step(self, u_t: torch.Tensor, state: MultiTimescaleState) -> tuple[torch.Tensor, MultiTimescaleState]:
-        """One 10 ms update. ``u_t``: ``[B, event_dim]`` (zeros if no event) -> ``y_t``: ``[B, output_dim]``."""
+    def step_branches(
+        self, u_t: torch.Tensor, state: MultiTimescaleState
+    ) -> tuple[torch.Tensor, torch.Tensor, MultiTimescaleState]:
+        """One 10 ms update, exposing the temporal and skip branches separately
+        (pre-fusion). ``step``/``forward`` are the only place the fusion formula
+        (``temporal + skip_gate * skip``) is written -- diagnostics call this
+        method and reuse ``self.skip``/``self.skip_gate`` directly instead of
+        re-deriving the formula, so production and diagnostic code can't drift
+        apart (see docs/reports/stage1_v0.md gate-fusion discrepancy).
+        """
         new_state = self.dynamics(u_t, state, self.step_seconds)
         fused = torch.cat([new_state.fast, new_state.mid, new_state.slow], dim=-1)
-        y_t = self.to_output(self.norm(fused)) + self.skip_gate * self.skip(u_t)
+        temporal = self.to_output(self.norm(fused))
+        skip = self.skip(u_t)
+        return temporal, skip, new_state
+
+    def step(self, u_t: torch.Tensor, state: MultiTimescaleState) -> tuple[torch.Tensor, MultiTimescaleState]:
+        """One 10 ms update. ``u_t``: ``[B, event_dim]`` (zeros if no event) -> ``y_t``: ``[B, output_dim]``."""
+        temporal, skip, new_state = self.step_branches(u_t, state)
+        y_t = temporal + self.skip_gate * skip
         return y_t, new_state
 
     def forward(self, u: torch.Tensor, state: MultiTimescaleState | None = None) -> tuple[torch.Tensor, MultiTimescaleState]:

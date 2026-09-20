@@ -7,6 +7,28 @@ import torchaudio
 from torch import nn
 
 
+def align_for_reconstruction(x: torch.Tensor, x_hat: torch.Tensor, delay: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shift ``x_hat`` against ``x`` by ``delay`` samples before comparing them.
+
+    The frontend/decoder/generator stack is strictly causal: with left-only
+    padding, output sample ``p`` (within a 240-sample frame starting at
+    ``240*floor(p/240)``) only ever depends on input up to that frame's start,
+    not on the samples within the frame it is nominally reconstructing. Naive
+    same-index comparison (``x_hat[p]`` vs ``x[p]``) therefore asks the model
+    to predict up to 239/240 of its own frame before having observed it. ``x``
+    is delayed by exactly one frontend frame (``delay=240`` samples = 10 ms)
+    relative to ``x_hat``: comparing ``x_hat[delay:]`` against ``x[:-delay]``
+    means position ``p`` (post-shift) reconstructs the real input sample the
+    model had actually already seen by the time it produced that output.
+
+    This does not, by itself, add streaming latency to the model -- it only
+    fixes what the loss compares against what. See docs/reports/stage1_v0.md.
+    """
+    if delay <= 0:
+        return x, x_hat
+    return x[..., :-delay], x_hat[..., delay:]
+
+
 class MultiResolutionSTFTLoss(nn.Module):
     """Sum of spectral-convergence + log-magnitude losses across several FFT sizes."""
 
@@ -44,12 +66,17 @@ class ReconstructionLoss(nn.Module):
         mel_weight: float = 1.0,
         stft_weight: float = 1.0,
         eps: float = 1e-2,
+        delay: int = 0,
     ) -> None:
         super().__init__()
         self.wav_weight = wav_weight
         self.mel_weight = mel_weight
         self.stft_weight = stft_weight
         self.eps = eps
+        # See align_for_reconstruction: the model's output at sample p only depends on input up
+        # to p's frame start, so naive same-index comparison scores it against unseen future
+        # samples. delay=240 (one 10ms frontend frame) is the model's actual analysis lag.
+        self.delay = delay
 
         self.mel = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate, n_fft=1024, hop_length=240, n_mels=n_mels
@@ -60,6 +87,7 @@ class ReconstructionLoss(nn.Module):
 
     def forward(self, x: torch.Tensor, x_hat: torch.Tensor) -> dict[str, torch.Tensor]:
         """``x``, ``x_hat``: ``[B, 1, samples]``."""
+        x, x_hat = align_for_reconstruction(x, x_hat, self.delay)
         wav_loss = torch.nn.functional.l1_loss(x, x_hat)
 
         # log-compressed mel (power spectrogram is unbounded and would otherwise

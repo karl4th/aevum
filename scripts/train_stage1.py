@@ -55,7 +55,7 @@ from pathlib import Path
 
 import torch
 import torchaudio
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from aevum.data.librispeech import LibriSpeechSegments
 from aevum.models.autoencoder import DenseContinuousAutoencoder
@@ -66,6 +66,38 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the AEVUM Stage 1 dense continuous autoencoder")
     parser.add_argument("--data-root", type=str, default="data/raw")
     parser.add_argument("--librispeech-url", type=str, default="dev-clean")
+    parser.add_argument(
+        "--val-url",
+        type=str,
+        default="test-clean",
+        help="LibriSpeech split used for validation. Must differ from --librispeech-url -- LibriSpeech "
+        "splits have disjoint speakers by construction, so this alone gives held-out (unseen-speaker) "
+        "validation instead of scoring a training example (see docs/reports/stage1_v0.md). Default "
+        "pairs with --librispeech-url's default of dev-clean without colliding.",
+    )
+    parser.add_argument("--val-data-root", type=str, default=None, help="defaults to --data-root")
+    parser.add_argument(
+        "--val-max-segments",
+        type=int,
+        default=256,
+        help="cap the number of validation segments used per epoch for the scheduler/best-checkpoint "
+        "loss (0 = use the full split). Aggregated, not a single clip -- see docs/reports/stage1_v0.md.",
+    )
+    parser.add_argument(
+        "--val-panel-size",
+        type=int,
+        default=4,
+        help="number of fixed validation clips saved as audio each epoch for listening",
+    )
+    parser.add_argument(
+        "--alignment-delay",
+        type=int,
+        default=None,
+        help="samples of delay between output and target in the reconstruction loss (see "
+        "align_for_reconstruction). Default: the model's own total_stride (240 = one 10ms "
+        "frontend frame), the minimum needed for a causally fair comparison. Pass 0 to "
+        "reproduce the old (misaligned) loss for an A/B comparison.",
+    )
     parser.add_argument("--segment-seconds", type=float, default=2.0)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -103,7 +135,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every-epochs", type=int, default=1)
     parser.add_argument("--checkpoint-dir", type=str, default="outputs")
     parser.add_argument("--log-file", type=str, default=None, help="JSON log path, default <checkpoint-dir>/train_log.json")
-    parser.add_argument("--resume", type=str, default=None, help="path to a checkpoint (.pt) to resume model weights from")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="path to a full training checkpoint (.pt, as written by this script) to resume from: "
+        "model + optimizer + scheduler + epoch + best_val_loss + RNG state. Continues the same "
+        "experiment (same output dir/log recommended) rather than starting a new one.",
+    )
+    parser.add_argument(
+        "--init-weights",
+        type=str,
+        default=None,
+        help="path to a checkpoint (.pt) to load only model weights from -- fresh optimizer/scheduler/"
+        "epoch/best_val_loss. For fine-tuning or starting a new experiment from a pretrained model, "
+        "not for continuing an interrupted run (use --resume for that). Accepts either this script's "
+        "full checkpoint format or a bare state_dict.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes")
     parser.add_argument(
@@ -139,6 +187,13 @@ def main() -> None:
         flush=True,
     )
 
+    if args.val_url == args.librispeech_url:
+        raise ValueError(
+            f"--val-url ({args.val_url!r}) equals --librispeech-url: validation would score "
+            "examples the model can also train on. Use a disjoint LibriSpeech split, e.g. "
+            "dev-clean when training on train-clean-100."
+        )
+
     dataset = LibriSpeechSegments(
         root=args.data_root, url=args.librispeech_url, segment_seconds=args.segment_seconds
     )
@@ -153,22 +208,75 @@ def main() -> None:
     )
     steps_per_epoch = len(loader)
 
-    # Fixed held-out clip for periodic listening/eval — reconstruction quality on
+    # Held-out split (disjoint speakers from --librispeech-url by LibriSpeech's own split
+    # construction) -- val_loss below is an aggregate over this, not one memorizable clip.
+    val_dataset = LibriSpeechSegments(
+        root=args.val_data_root or args.data_root, url=args.val_url, segment_seconds=args.segment_seconds
+    )
+    val_indices = list(range(len(val_dataset)))
+    if args.val_max_segments and len(val_indices) > args.val_max_segments:
+        g = torch.Generator().manual_seed(0)
+        val_indices = torch.randperm(len(val_indices), generator=g)[: args.val_max_segments].tolist()
+    val_loader = DataLoader(
+        Subset(val_dataset, val_indices), batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+    )
+
+    # Fixed panel of held-out clips for periodic listening -- reconstruction quality on
     # varying training batches is too noisy step-to-step to judge progress by ear.
-    torch.manual_seed(0)
-    val_waveform = dataset[0].unsqueeze(0).to(device)
+    panel_size = min(args.val_panel_size, len(val_dataset))
+    val_panel = torch.stack([val_dataset[i] for i in range(panel_size)]).to(device)
 
     model = DenseContinuousAutoencoder().to(device)
-    if args.resume:
-        model.load_state_dict(torch.load(args.resume, map_location=device))
-        print(f"resumed model weights from {args.resume}", flush=True)
+    start_epoch = 0
+    best_val_loss = float("inf")
+    optimizer_state = None
+    scheduler_state = None
+    rng_state = None
+    resumed_epoch_log: list[dict] = []
+
+    if args.init_weights:
+        ckpt = torch.load(args.init_weights, map_location=device)
+        model.load_state_dict(ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt)
+        print(f"initialized model weights from {args.init_weights} (fresh optimizer/scheduler/epoch)", flush=True)
+    elif args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        if not (isinstance(ckpt, dict) and "model" in ckpt):
+            raise ValueError(
+                f"{args.resume} is not a full training checkpoint (no optimizer/scheduler/epoch/RNG "
+                "state) -- use --init-weights to load it as a fresh run's starting weights instead."
+            )
+        model.load_state_dict(ckpt["model"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val_loss = ckpt["best_val_loss"]
+        optimizer_state = ckpt["optimizer"]
+        scheduler_state = ckpt.get("scheduler")
+        rng_state = ckpt.get("rng_state")
+        existing_log = Path(args.log_file) if args.log_file else Path(args.checkpoint_dir) / "train_log.json"
+        if existing_log.exists():
+            resumed_epoch_log = json.loads(existing_log.read_text()).get("epochs", [])
+        print(
+            f"resumed full training state from {args.resume}: epoch {start_epoch}, "
+            f"best_val_loss {best_val_loss:.4f}",
+            flush=True,
+        )
+        if rng_state is not None:
+            torch.set_rng_state(rng_state["torch"])
+            if rng_state.get("cuda") is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng_state["cuda"])
+
+    alignment_delay = model.total_stride if args.alignment_delay is None else args.alignment_delay
     criterion = ReconstructionLoss(
-        wav_weight=args.wav_weight, mel_weight=args.mel_weight, stft_weight=args.stft_weight
+        wav_weight=args.wav_weight,
+        mel_weight=args.mel_weight,
+        stft_weight=args.stft_weight,
+        delay=alignment_delay,
     ).to(device)
     # Fused AdamW: one CUDA kernel across all parameter tensors instead of one per tensor --
     # this model is many small Linear layers, so unfused Adam issues many tiny kernel launches
     # per optimizer.step(), same launch-overhead problem as the encoder/decoder loop.
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=(device.type == "cuda"))
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
 
     # Keep a handle to the uncompiled module for checkpointing: torch.compile's wrapper can
     # save/load state_dict keys with a "_orig_mod." prefix depending on version, which would
@@ -192,29 +300,52 @@ def main() -> None:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs * steps_per_epoch, eta_min=args.lr_min
         )
+    if scheduler is not None and scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+
+    def save_checkpoint(path: Path) -> None:
+        """Full training state, not just weights -- see --resume/--init-weights above."""
+        torch.save(
+            {
+                "model": checkpoint_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "epoch": epoch,
+                "best_val_loss": best_val_loss,
+                "rng_state": {
+                    "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                },
+            },
+            path,
+        )
 
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     samples_dir = checkpoint_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(str(samples_dir / "val_target.wav"), val_waveform[0].cpu(), 24_000)
+    for i in range(val_panel.shape[0]):
+        torchaudio.save(str(samples_dir / f"val_target_{i}.wav"), val_panel[i].cpu(), 24_000)
 
     log_path = Path(args.log_file) if args.log_file else checkpoint_dir / "train_log.json"
     run_config = vars(args) | {
         "model_params": sum(p.numel() for p in model.parameters()),
         "device": str(device),
         "steps_per_epoch": steps_per_epoch,
+        "val_segments_used": len(val_indices),
+        "alignment_delay_samples": alignment_delay,
     }
-    epoch_log: list[dict] = []
+    epoch_log: list[dict] = resumed_epoch_log
 
     def write_log() -> None:
-        log_path.write_text(json.dumps({"config": run_config, "epochs": epoch_log}, indent=2))
+        tmp = log_path.with_suffix(log_path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"config": run_config, "epochs": epoch_log}, indent=2))
+        tmp.replace(log_path)
 
-    best_val_loss = float("inf")
     start_time = time.perf_counter()
-    audio_seconds_seen = 0.0
+    audio_seconds_seen = sum(r.get("audio_seconds_seen", 0.0) for r in resumed_epoch_log[-1:])
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         # Accumulated as GPU tensors, not Python floats: a per-step `.item()` forces a
         # CPU-GPU sync, which serializes exactly the launch-overhead-bound loop this whole
@@ -265,11 +396,19 @@ def main() -> None:
         }
 
         model.eval()
+        val_running = torch.zeros((), device=device)
+        val_batches = 0
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.amp):
-            val_recon = model(val_waveform)
-        val_loss = criterion(val_waveform, val_recon.float())["total"].item()
+            for val_waveform in val_loader:
+                val_waveform = val_waveform.to(device, non_blocking=True)
+                val_out = model(val_waveform)
+                val_running += criterion(val_waveform, val_out.float())["total"].detach()
+                val_batches += 1
+            val_loss = (val_running / val_batches).item()
 
-        torchaudio.save(str(samples_dir / f"val_epoch{epoch}.wav"), val_recon[0].float().cpu(), 24_000)
+            panel_recon = model(val_panel)  # fixed panel, saved for listening only
+        for i in range(val_panel.shape[0]):
+            torchaudio.save(str(samples_dir / f"val_epoch{epoch}_{i}.wav"), panel_recon[i].float().cpu(), 24_000)
 
         if args.lr_scheduler == "plateau":
             lr_before = optimizer.param_groups[0]["lr"]
@@ -284,8 +423,9 @@ def main() -> None:
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
-            torchaudio.save(str(samples_dir / "val_best.wav"), val_recon[0].float().cpu(), 24_000)
-            torch.save(checkpoint_model.state_dict(), checkpoint_dir / "stage1_best.pt")
+            for i in range(val_panel.shape[0]):
+                torchaudio.save(str(samples_dir / f"val_best_{i}.wav"), panel_recon[i].float().cpu(), 24_000)
+            save_checkpoint(checkpoint_dir / "stage1_best.pt")
 
         record = {
             "epoch": epoch,
@@ -314,9 +454,9 @@ def main() -> None:
         )
 
         if (epoch + 1) % args.checkpoint_every_epochs == 0:
-            torch.save(checkpoint_model.state_dict(), checkpoint_dir / f"stage1_epoch{epoch}.pt")
+            save_checkpoint(checkpoint_dir / f"stage1_epoch{epoch}.pt")
 
-    torch.save(checkpoint_model.state_dict(), checkpoint_dir / "stage1_final.pt")
+    save_checkpoint(checkpoint_dir / "stage1_final.pt")
     write_log()
     print(f"\ntrain log written to: {log_path}", flush=True)
 

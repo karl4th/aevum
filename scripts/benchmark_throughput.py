@@ -32,6 +32,11 @@ def benchmark(model, criterion, optimizer, batch_size: int, seconds: float, devi
         optimizer.step()
     if device.type == "cuda":
         torch.cuda.synchronize()
+        # Reset right before the measured interval, not after: resetting afterwards (the
+        # previous order here) discards the forward/backward peak before main() ever reads
+        # max_memory_allocated(), so the printed figures were post-peak leftovers, not the
+        # actual peak (docs/reports/stage1_v0.md).
+        torch.cuda.reset_peak_memory_stats()
 
     t0 = time.perf_counter()
     for _ in range(steps):
@@ -44,8 +49,6 @@ def benchmark(model, criterion, optimizer, batch_size: int, seconds: float, devi
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
 
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats()
     return elapsed / steps
 
 
@@ -66,9 +69,6 @@ def main() -> None:
         model = DenseContinuousAutoencoder().to(device)
         criterion = ReconstructionLoss().to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats()
 
         try:
             step_time = benchmark(model, criterion, optimizer, batch_size, args.seconds, device, args.warmup, args.steps)

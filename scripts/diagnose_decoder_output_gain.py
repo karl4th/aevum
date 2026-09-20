@@ -135,25 +135,30 @@ def compute_frozen_z(
 
 def decoder_forward_with_stats(
     decoder: ContinuousDecoder, u: torch.Tensor, device: torch.device
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Manually replicates ContinuousDecoder.forward, additionally returning
-    stacked per-branch hidden states so their RMS/abs-max can be inspected."""
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Runs ``decoder.step_branches`` (the same fusion building blocks
+    ``ContinuousDecoder.step`` uses in production) and returns the temporal
+    branch, the skip branch, and stacked per-branch hidden states -- both raw,
+    un-gated/un-fused, so this diagnostic can apply its own gate ablations
+    without re-deriving the decoder's fusion formula."""
     batch_size = u.shape[0]
     state = decoder.initial_state(batch_size, device)
-    y_steps, fast_steps, mid_steps, slow_steps = [], [], [], []
+    temporal_steps, skip_steps, fast_steps, mid_steps, slow_steps = [], [], [], [], []
     for t in range(u.shape[1]):
-        y_t, state = decoder.step(u[:, t, :], state)
-        y_steps.append(y_t)
+        temporal_t, skip_t, state = decoder.step_branches(u[:, t, :], state)
+        temporal_steps.append(temporal_t)
+        skip_steps.append(skip_t)
         fast_steps.append(state.fast)
         mid_steps.append(state.mid)
         slow_steps.append(state.slow)
-    y = torch.stack(y_steps, dim=1)  # [B, T, dim]
+    temporal_raw = torch.stack(temporal_steps, dim=1)  # [B, T, dim]
+    skip = torch.stack(skip_steps, dim=1)  # [B, T, dim]
     branch_states = {
         "fast": torch.stack(fast_steps, dim=1),
         "mid": torch.stack(mid_steps, dim=1),
         "slow": torch.stack(slow_steps, dim=1),
     }
-    return y, branch_states
+    return temporal_raw, skip, branch_states
 
 
 def generator_forward_with_pretanh(generator: CausalWaveformGenerator, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -210,7 +215,6 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
         disable_cross_connections=args.disable_decoder_cross_connections,
     ).to(device)
     decoder_cells = {"fast": decoder.dynamics.fast_cell, "mid": decoder.dynamics.mid_cell, "slow": decoder.dynamics.slow_cell}
-    w_skip_decoder = identity_conv1d(dim, device)
     generator = CausalWaveformGenerator(input_dim=dim).to(device)
 
     num_frames = target.shape[-1] // generator.total_stride
@@ -236,7 +240,7 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
 
     gate_decoder = nn.Parameter(torch.tensor(gate_value, device=device)) if gate_trainable else torch.tensor(gate_value, device=device)
 
-    trainable_modules = [decoder, w_skip_decoder, generator]
+    trainable_modules = [decoder, generator]
     params = [p for m in trainable_modules for p in m.parameters()]
     if gate_trainable:
         params.append(gate_decoder)
@@ -261,8 +265,7 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
             for cell in decoder_cells.values():
                 cell.start_recording()
 
-        temporal_raw, branch_states = decoder_forward_with_stats(decoder, z_bt, device)  # [B, T, dim]
-        skip = w_skip_decoder(z_raw).transpose(1, 2)  # [B, T, dim] -- recomputed since w_skip_decoder is trainable
+        temporal_raw, skip, branch_states = decoder_forward_with_stats(decoder, z_bt, device)  # [B, T, dim] each
 
         if ablation == "fixed_gain":
             raw_rms = temporal_raw.detach().pow(2).mean().sqrt().clamp_min(1e-8)
