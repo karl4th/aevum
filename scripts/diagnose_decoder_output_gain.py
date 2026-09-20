@@ -237,6 +237,8 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
         label += "_dec_fixed_tau"
     if args.disable_decoder_cross_connections:
         label += "_no_dec_cross"
+    if args.gate_branch == "skip":
+        label += "_gate_on_skip"  # non-default: matches production's decoder.step fusion
 
     gate_decoder = nn.Parameter(torch.tensor(gate_value, device=device)) if gate_trainable else torch.tensor(gate_value, device=device)
 
@@ -246,7 +248,8 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
         params.append(gate_decoder)
     print(f"\n=== {label} ===  trainable params: {sum(p.numel() for p in params):,}")
 
-    criterion = ReconstructionLoss().to(device)
+    alignment_delay = generator.total_stride if args.alignment_delay is None else args.alignment_delay
+    criterion = ReconstructionLoss(delay=alignment_delay).to(device)
     optimizer = torch.optim.AdamW(params, lr=args.lr)
 
     out_dir = Path(args.out_dir) if args.out_dir else Path(f"outputs/decoder_output_gain_{label}")
@@ -273,8 +276,19 @@ def run_ablation(args: argparse.Namespace, ablation: str, gate_override: float |
         else:
             temporal_for_gate = temporal_raw
 
-        temporal_gated = gate_decoder * temporal_for_gate
-        generator_in = (skip + temporal_gated).transpose(1, 2)  # [B, dim, T]
+        # args.gate_branch picks WHICH branch gate_decoder scales -- ContinuousDecoder.fuse is
+        # the same production formula either way (fuse(base, x, gate) = base + gate*x), called
+        # with the two operands swapped depending on which one is meant to be gated. Production
+        # (decoder.step) always gates skip; this script defaults to gating temporal (its
+        # original, historical ablation design -- see module docstring's "no_temporal" gate=0.0
+        # meaning "only skip(z) reaches the generator") -- the two are NOT equivalent at the
+        # same gate value, so which one is active is always logged and labeled explicitly.
+        if args.gate_branch == "skip":
+            temporal_gated = temporal_for_gate  # logged/reported name kept for output compatibility
+            generator_in = ContinuousDecoder.fuse(temporal_for_gate, skip, gate_decoder).transpose(1, 2)
+        else:
+            temporal_gated = gate_decoder * temporal_for_gate
+            generator_in = ContinuousDecoder.fuse(skip, temporal_for_gate, gate_decoder).transpose(1, 2)
 
         recon, pre_tanh = generator_forward_with_pretanh(generator, generator_in)
         loss_dict = criterion(target, recon)
@@ -358,6 +372,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Decompose generator_in and ablate decoder-v3's output gain path")
     parser.add_argument("--ablation", choices=[*ALL_ABLATIONS, "all"], default="all")
     parser.add_argument(
+        "--gate-branch",
+        choices=["temporal", "skip"],
+        default="temporal",
+        help="which branch gate_decoder scales via ContinuousDecoder.fuse (fuse(base, x, gate) = "
+        "base + gate*x). 'temporal' (default) is this script's original ablation design -- "
+        "gate_decoder=0 means 'only skip(z) reaches the generator' (see 'no_temporal' above). "
+        "'skip' matches production's decoder.step instead (skip_gate scales skip, temporal is "
+        "full-weight) -- the two are NOT equivalent at the same gate value; pass 'skip' to "
+        "directly compare against what decoder.step actually does.",
+    )
+    parser.add_argument(
         "--gate-values",
         type=float,
         nargs="+",
@@ -396,6 +421,12 @@ def main() -> None:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument(
+        "--alignment-delay",
+        type=int,
+        default=None,
+        help="see train_stage1.py --alignment-delay. Default: generator.total_stride (240).",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 

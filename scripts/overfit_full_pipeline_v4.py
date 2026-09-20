@@ -88,6 +88,12 @@ def main() -> None:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--out-dir", type=str, default="outputs/full_pipeline_v4")
+    parser.add_argument(
+        "--alignment-delay",
+        type=int,
+        default=None,
+        help="see train_stage1.py --alignment-delay. Default: generator.total_stride (240).",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -125,7 +131,8 @@ def main() -> None:
     param_count = sum(p.numel() for p in params)
     print(f"gate_init={args.gate_init} decoder_gate(fixed)={args.decoder_gate} params={param_count:,}")
 
-    criterion = ReconstructionLoss().to(device)
+    alignment_delay = generator.total_stride if args.alignment_delay is None else args.alignment_delay
+    criterion = ReconstructionLoss(delay=alignment_delay).to(device)
     optimizer = torch.optim.AdamW(params, lr=args.lr)
 
     out_dir = Path(args.out_dir)

@@ -121,6 +121,12 @@ def _ensure_downloaded_and_extracted(root: Path, url: str, download: bool) -> No
     expected_hash = _CHECKSUMS.get(download_url)
     split_dir = root / "LibriSpeech" / url
 
+    if split_dir.is_dir() and not archive.is_file() and download:
+        # Get the archive so the directory can actually be verified below, instead of
+        # trusting it unverified just because download=True happens to be set.
+        print(f"found '{url}' directory but no archive/marker -- downloading archive to verify completeness ...", flush=True)
+        _download_with_progress(download_url, archive, expected_hash)
+
     if split_dir.is_dir() and archive.is_file():
         print(f"found '{url}' directory and archive but no completion marker -- verifying against the archive ...", flush=True)
         missing = _missing_or_incomplete_members(archive, root)
@@ -130,15 +136,18 @@ def _ensure_downloaded_and_extracted(root: Path, url: str, download: bool) -> No
             return
         print(f"  {len(missing)} file(s) missing/incomplete (interrupted previous extract) -- re-extracting those", flush=True)
     elif split_dir.is_dir() and not archive.is_file():
-        # Can't verify completeness without the archive to check against, and (if download=False)
-        # no way to re-fetch it either. Trust the existing directory as a last resort rather than
-        # failing outright, but don't claim it was verified.
+        # download=False and no archive to verify against, so completeness genuinely can't be
+        # checked. Trust the existing directory for *this* run, but deliberately do not write a
+        # completion marker: writing one here would make the *next* run's bare marker.exists()
+        # check treat this same unverified directory as verified, which is the exact bug this
+        # marker scheme exists to prevent. Every run re-does this (cheap) check until a real
+        # verification (archive present, or a fresh extract) can write the marker for real.
         print(
-            f"found '{url}' directory under {root} but no archive to verify against and no marker -- "
-            "trusting it as-is (completeness NOT verified); delete it and re-run to get a verified extract",
+            f"found '{url}' directory under {root} but no archive to verify against (download=False) -- "
+            "trusting it for this run only (NOT writing a completion marker); pass download=True or "
+            "supply the archive to get a verified, cached extract",
             flush=True,
         )
-        marker.write_text(json.dumps({"url": url, "archive_sha256_prefix": None, "verified": False}))
         return
     else:
         missing = None  # fresh extract, not a partial-recovery re-verify
@@ -219,7 +228,16 @@ class LibriSpeechSegments(Dataset):
 
         fingerprint = self._corpus_fingerprint()
         index_path = root / f"segment_index_{url}_{segment_seconds}s.json"
-        cached = json.loads(index_path.read_text()) if index_path.exists() else None
+        cached = None
+        if index_path.exists():
+            try:
+                loaded = json.loads(index_path.read_text())
+            except json.JSONDecodeError:
+                loaded = None
+            # Pre-schema caches were a bare JSON array (list), not the current
+            # {"schema_version": ..., "segments": [...]} dict -- .get() on a list raises
+            # AttributeError instead of falling through to "stale, rebuild".
+            cached = loaded if isinstance(loaded, dict) else None
         if (
             cached is not None
             and cached.get("schema_version") == _INDEX_SCHEMA_VERSION

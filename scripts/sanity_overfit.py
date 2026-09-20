@@ -64,6 +64,13 @@ def main() -> None:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument(
+        "--alignment-delay",
+        type=int,
+        default=None,
+        help="see train_stage1.py --alignment-delay. Default: model.total_stride (240). Without "
+        "this, this sanity check silently solves a different (misaligned) task than train_stage1.py.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -71,7 +78,8 @@ def main() -> None:
     torch.manual_seed(0)
 
     model = DenseContinuousAutoencoder().to(device)
-    criterion = ReconstructionLoss().to(device)
+    alignment_delay = model.total_stride if args.alignment_delay is None else args.alignment_delay
+    criterion = ReconstructionLoss(delay=alignment_delay).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     if args.source == "real":

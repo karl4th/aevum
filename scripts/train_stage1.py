@@ -64,6 +64,9 @@ from aevum.training.losses.reconstruction import ReconstructionLoss
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the AEVUM Stage 1 dense continuous autoencoder")
+    parser.add_argument(
+        "--seed", type=int, default=0, help="seeds model init and training RNG for a fresh (non---resume) run"
+    )
     parser.add_argument("--data-root", type=str, default="data/raw")
     parser.add_argument("--librispeech-url", type=str, default="dev-clean")
     parser.add_argument(
@@ -181,6 +184,11 @@ def main() -> None:
     # instead of re-tuning every batch.
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
+    # Seeds model init (and, for a fresh run, the training RNG going forward). On --resume this
+    # gets overwritten by the checkpoint's own saved RNG state below, which is what should
+    # actually drive a resumed run's randomness -- reseeding here first just makes the window
+    # before that restore deterministic too, rather than leaving it as leftover global state.
+    torch.manual_seed(args.seed)
     print(
         f"starting run: device={device} data_root={args.data_root} url={args.librispeech_url} "
         f"compile={args.compile} amp_bf16={args.amp} num_workers={args.num_workers}",
@@ -227,6 +235,7 @@ def main() -> None:
     val_panel = torch.stack([val_dataset[i] for i in range(panel_size)]).to(device)
 
     model = DenseContinuousAutoencoder().to(device)
+    alignment_delay = model.total_stride if args.alignment_delay is None else args.alignment_delay
     start_epoch = 0
     best_val_loss = float("inf")
     optimizer_state = None
@@ -234,26 +243,68 @@ def main() -> None:
     rng_state = None
     resumed_epoch_log: list[dict] = []
 
+    # map_location="cpu" (not `device`) even for a GPU run: torch.load with map_location=device
+    # would move rng_state["torch"]/["cuda"] onto CUDA too, but torch.set_rng_state /
+    # cuda.set_rng_state_all both require CPU ByteTensors -- loading to CPU first and letting
+    # load_state_dict's own device handling move model/optimizer tensors to `device` is the
+    # approach that works for both.
     if args.init_weights:
-        ckpt = torch.load(args.init_weights, map_location=device)
+        ckpt = torch.load(args.init_weights, map_location="cpu")
         model.load_state_dict(ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt)
         print(f"initialized model weights from {args.init_weights} (fresh optimizer/scheduler/epoch)", flush=True)
     elif args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location="cpu")
         if not (isinstance(ckpt, dict) and "model" in ckpt):
             raise ValueError(
                 f"{args.resume} is not a full training checkpoint (no optimizer/scheduler/epoch/RNG "
                 "state) -- use --init-weights to load it as a fresh run's starting weights instead."
             )
+        # best_val_loss and the loss/scheduler state being resumed are only meaningful if this
+        # run is measuring the same thing the checkpoint was -- e.g. a different alignment_delay
+        # or validation split makes "improved over best_val_loss" compare two different metrics.
+        prior_config = ckpt.get("run_config")
+        if prior_config is not None:
+            # Keys/values must match run_config's own naming exactly (see run_config below) --
+            # it's built from vars(args) plus "alignment_delay_samples", not a re-derived dict.
+            current = {
+                "alignment_delay_samples": alignment_delay,
+                "wav_weight": args.wav_weight,
+                "mel_weight": args.mel_weight,
+                "stft_weight": args.stft_weight,
+                "val_url": args.val_url,
+                "val_data_root": args.val_data_root,
+                "librispeech_url": args.librispeech_url,
+                "segment_seconds": args.segment_seconds,
+            }
+            mismatched = {k: (prior_config.get(k), v) for k, v in current.items() if prior_config.get(k) != v}
+            if mismatched:
+                raise ValueError(
+                    f"{args.resume} was trained with different settings than this run: "
+                    f"{ {k: f'checkpoint={old!r} vs this run={new!r}' for k, (old, new) in mismatched.items()} } "
+                    "-- best_val_loss/scheduler state from it isn't comparable to this run's metric. "
+                    "Use --init-weights instead if you want to start a new experiment from these weights."
+                )
+        else:
+            print(f"warning: {args.resume} has no saved run_config (older checkpoint) -- compatibility not checked", flush=True)
         model.load_state_dict(ckpt["model"])
         start_epoch = ckpt["epoch"] + 1
+        if start_epoch >= args.epochs:
+            raise ValueError(
+                f"checkpoint {args.resume} is already at epoch {ckpt['epoch']} >= --epochs {args.epochs}; "
+                "nothing to resume. Raise --epochs to continue training this run."
+            )
         best_val_loss = ckpt["best_val_loss"]
         optimizer_state = ckpt["optimizer"]
         scheduler_state = ckpt.get("scheduler")
         rng_state = ckpt.get("rng_state")
         existing_log = Path(args.log_file) if args.log_file else Path(args.checkpoint_dir) / "train_log.json"
         if existing_log.exists():
-            resumed_epoch_log = json.loads(existing_log.read_text()).get("epochs", [])
+            # Truncate to what the checkpoint being resumed actually saw: the log file can be
+            # ahead of it (e.g. resuming from an earlier "best" checkpoint than the run's last
+            # completed epoch), and appending onto un-truncated history would duplicate epoch
+            # numbers and make audio_seconds_seen jump backwards.
+            all_epochs = json.loads(existing_log.read_text()).get("epochs", [])
+            resumed_epoch_log = [r for r in all_epochs if r["epoch"] < start_epoch]
         print(
             f"resumed full training state from {args.resume}: epoch {start_epoch}, "
             f"best_val_loss {best_val_loss:.4f}",
@@ -264,7 +315,6 @@ def main() -> None:
             if rng_state.get("cuda") is not None and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(rng_state["cuda"])
 
-    alignment_delay = model.total_stride if args.alignment_delay is None else args.alignment_delay
     criterion = ReconstructionLoss(
         wav_weight=args.wav_weight,
         mel_weight=args.mel_weight,
@@ -304,7 +354,10 @@ def main() -> None:
         scheduler.load_state_dict(scheduler_state)
 
     def save_checkpoint(path: Path) -> None:
-        """Full training state, not just weights -- see --resume/--init-weights above."""
+        """Full training state, not just weights -- see --resume/--init-weights above.
+        Written to a temp file and renamed into place so a crash mid-save can't leave a
+        half-written stage1_best.pt/stage1_final.pt behind."""
+        tmp = path.with_suffix(path.suffix + ".tmp")
         torch.save(
             {
                 "model": checkpoint_model.state_dict(),
@@ -312,13 +365,15 @@ def main() -> None:
                 "scheduler": scheduler.state_dict() if scheduler is not None else None,
                 "epoch": epoch,
                 "best_val_loss": best_val_loss,
+                "run_config": run_config,
                 "rng_state": {
                     "torch": torch.get_rng_state(),
                     "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                 },
             },
-            path,
+            tmp,
         )
+        tmp.replace(path)
 
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -397,14 +452,19 @@ def main() -> None:
 
         model.eval()
         val_running = torch.zeros((), device=device)
-        val_batches = 0
+        val_segments = 0
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.amp):
             for val_waveform in val_loader:
                 val_waveform = val_waveform.to(device, non_blocking=True)
                 val_out = model(val_waveform)
-                val_running += criterion(val_waveform, val_out.float())["total"].detach()
-                val_batches += 1
-            val_loss = (val_running / val_batches).item()
+                # Weight by segment count, not batch count: val_max_segments/batch_size don't
+                # always divide evenly, so the last batch can be smaller -- an unweighted mean
+                # of per-batch means would over/under-count it relative to its actual share of
+                # validation audio (docs/reports/stage1_v0.md).
+                batch_loss = criterion(val_waveform, val_out.float())["total"].detach()
+                val_running += batch_loss * val_waveform.shape[0]
+                val_segments += val_waveform.shape[0]
+            val_loss = (val_running / val_segments).item()
 
             panel_recon = model(val_panel)  # fixed panel, saved for listening only
         for i in range(val_panel.shape[0]):
